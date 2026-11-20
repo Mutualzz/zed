@@ -598,6 +598,66 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
+fn min_content_size(
+    text: &SharedString,
+    runs: &[TextRun],
+    font_size: Pixels,
+    line_height: Pixels,
+    window: &mut Window,
+) -> Size<Pixels> {
+    let Some(unwrapped) = window
+        .text_system()
+        .shape_text(text.clone(), font_size, runs, None, None)
+        .log_err()
+    else {
+        return Size::default();
+    };
+    let mut widest_word = Pixels::ZERO;
+    for line in &unwrapped {
+        let layout = &line.layout.unwrapped_layout;
+        let mut glyphs: Vec<(usize, Pixels)> = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.index, glyph.position.x)))
+            .collect();
+        glyphs.sort_by_key(|(index, _)| *index);
+        let mut word_start = None;
+        for (index, x) in glyphs {
+            let is_whitespace = line
+                .text
+                .get(index..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(char::is_whitespace);
+            if is_whitespace {
+                if let Some(start) = word_start.take() {
+                    widest_word = widest_word.max(x - start);
+                }
+            } else if word_start.is_none() {
+                word_start = Some(x);
+            }
+        }
+        if let Some(start) = word_start {
+            widest_word = widest_word.max(layout.width - start);
+        }
+    }
+    let widest_word = widest_word.ceil();
+    let Some(wrapped) = window
+        .text_system()
+        .shape_text(text.clone(), font_size, runs, Some(widest_word), None)
+        .log_err()
+    else {
+        return Size::default();
+    };
+    let mut size: Size<Pixels> = Size::default();
+    for line in &wrapped {
+        let line_size = line.size(line_height);
+        size.height += line_size.height;
+        size.width = size.width.max(line_size.width).ceil();
+    }
+    size.width = size.width.max(widest_word);
+    size
+}
+
 impl TextLayout {
     fn layout(
         &self,
@@ -623,6 +683,13 @@ impl TextLayout {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
+                if text_style.white_space == WhiteSpace::Normal
+                    && text_style.text_overflow.is_none()
+                    && known_dimensions.width.is_none()
+                    && available_space.width == crate::AvailableSpace::MinContent
+                {
+                    return min_content_size(&text, &runs, font_size, line_height, window);
+                }
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     known_dimensions.width.or(match available_space.width {
                         crate::AvailableSpace::Definite(x) => Some(x),
