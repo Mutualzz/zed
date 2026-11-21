@@ -1208,7 +1208,7 @@ PreparedBackground prepare_background(Background background) {
   prepared.tag = background.tag;
   prepared.color1 = float4(0.0);
 
-  if (background.tag == 1u) {
+  if (background.tag == 1u || background.tag == 4u) {
     prepared.color0 = hsla_to_rgba(background.colors[0].color);
     prepared.color1 = hsla_to_rgba(background.colors[1].color);
     // Interpolating in Oklab means converting the endpoints once rather
@@ -1282,6 +1282,30 @@ float4 background_color(PreparedBackground prepared, Background background,
       }
 
       // Dither to reduce banding in gradients (especially dark/alpha).
+      float dither = dither_offset(position);
+      color.rgb += dither * 1.0 / 255.0;
+      color.a += dither * 1.5 / 255.0;
+      break;
+    }
+    case 4: {
+      // Radial gradient: solid holds center.xy and radii.xy as fractions
+      // of the bounds; negative radii mean a circle to the farthest corner.
+      float2 center = origin + size * float2(background.solid.h, background.solid.s);
+      float2 radii = size * float2(background.solid.l, background.solid.a);
+      if (background.solid.l < 0.0) {
+        float2 far_corner = max(abs(center - origin), abs(origin + size - center));
+        float radius = length(far_corner);
+        radii = float2(radius, radius);
+      }
+      float distance = length((position - center) / max(radii, float2(0.0001)));
+      float span = background.colors[1].percentage - background.colors[0].percentage;
+      float t = span == 0.0
+                    ? step(background.colors[0].percentage, distance)
+                    : saturate((distance - background.colors[0].percentage) / span);
+      color = mix(prepared.color0, prepared.color1, t);
+      if (background.color_space == 1u) {
+        color = oklab_to_srgb(color);
+      }
       float dither = dither_offset(position);
       color.rgb += dither * 1.0 / 255.0;
       color.a += dither * 1.5 / 255.0;

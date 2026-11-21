@@ -730,6 +730,7 @@ impl WindowTextSystem {
 
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
+            let mut line_spacing = SmallVec::<[(usize, LetterSpacing); 4]>::new();
 
             let mut decoration_runs = <Vec<DecorationRun>>::new();
             let mut run_start = line_start;
@@ -740,6 +741,7 @@ impl WindowTextSystem {
                 };
 
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
+                line_spacing.push((run_len_within_line, run.letter_spacing));
 
                 let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
                     && last_run.color == run.color
@@ -781,10 +783,12 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
+            let letter_spacing = letter_spacing_runs(line_spacing.iter().copied());
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
                 &font_runs,
+                &letter_spacing,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
             );
@@ -861,9 +865,15 @@ impl WindowTextSystem {
         SharedString: From<Text>,
     {
         let font_runs = self.font_runs(runs);
-        let layout = self
-            .line_layout_cache
-            .layout_line(text, font_size, &font_runs, force_width);
+        let letter_spacing =
+            letter_spacing_runs(runs.iter().map(|run| (run.len, run.letter_spacing)));
+        let layout = self.line_layout_cache.layout_line(
+            text,
+            font_size,
+            &font_runs,
+            &letter_spacing,
+            force_width,
+        );
         self.font_runs_buffer.set(font_runs);
         layout
     }
@@ -916,6 +926,7 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                 }],
+                &[],
                 None,
             )
             .width
@@ -1074,6 +1085,8 @@ impl Display for FontStyle {
 pub struct TextRun {
     /// A number of utf8 bytes
     pub len: usize,
+    /// Extra space after every character, like CSS `letter-spacing`.
+    pub letter_spacing: LetterSpacing,
     /// The font to use for this run.
     pub font: Font,
     /// The color
@@ -1084,6 +1097,78 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+}
+
+/// Extra space added after every character, like CSS `letter-spacing`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum LetterSpacing {
+    /// A fixed amount of logical pixels.
+    Pixels(Pixels),
+    /// A multiple of the font size, like CSS `em`.
+    Em(f32),
+}
+
+impl Default for LetterSpacing {
+    fn default() -> Self {
+        LetterSpacing::Pixels(Pixels::ZERO)
+    }
+}
+
+impl LetterSpacing {
+    /// The spacing in pixels for the given font size.
+    pub fn to_pixels(self, font_size: Pixels) -> Pixels {
+        match self {
+            LetterSpacing::Pixels(pixels) => pixels,
+            LetterSpacing::Em(factor) => font_size * factor,
+        }
+    }
+
+    /// Whether this adds no space.
+    pub fn is_zero(self) -> bool {
+        match self {
+            LetterSpacing::Pixels(pixels) => pixels == Pixels::ZERO,
+            LetterSpacing::Em(factor) => factor == 0.0,
+        }
+    }
+}
+
+impl PartialEq for LetterSpacing {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LetterSpacing::Pixels(first), LetterSpacing::Pixels(second)) => first == second,
+            (LetterSpacing::Em(first), LetterSpacing::Em(second)) => {
+                first.to_bits() == second.to_bits()
+            }
+            _ => self.is_zero() && other.is_zero(),
+        }
+    }
+}
+
+impl Eq for LetterSpacing {}
+
+impl std::hash::Hash for LetterSpacing {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.is_zero() {
+            0u8.hash(state);
+            return;
+        }
+        match self {
+            LetterSpacing::Pixels(pixels) => {
+                1u8.hash(state);
+                pixels.hash(state);
+            }
+            LetterSpacing::Em(factor) => {
+                2u8.hash(state);
+                factor.to_bits().hash(state);
+            }
+        }
+    }
+}
+
+impl From<Pixels> for LetterSpacing {
+    fn from(pixels: Pixels) -> Self {
+        LetterSpacing::Pixels(pixels)
+    }
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1397,4 +1482,28 @@ mod missing_glyph_tests {
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
     }
+}
+
+fn letter_spacing_runs(
+    runs: impl Iterator<Item = (usize, LetterSpacing)>,
+) -> SmallVec<[LetterSpacingRun; 1]> {
+    let mut spacing_runs = SmallVec::<[LetterSpacingRun; 1]>::new();
+    let mut any_spacing = false;
+    for (len, spacing) in runs {
+        if len == 0 {
+            continue;
+        }
+        any_spacing |= !spacing.is_zero();
+        if let Some(last) = spacing_runs.last_mut()
+            && last.spacing == spacing
+        {
+            last.len += len;
+        } else {
+            spacing_runs.push(LetterSpacingRun { len, spacing });
+        }
+    }
+    if !any_spacing {
+        spacing_runs.clear();
+    }
+    spacing_runs
 }

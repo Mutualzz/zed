@@ -2,7 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    LetterSpacing, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
@@ -529,6 +529,26 @@ pub trait Styled: Sized {
     /// This value cascades to its child elements.
     fn text_bg(mut self, bg: impl Into<Hsla>) -> Self {
         self.text_style().background_color = Some(bg.into());
+        self
+    }
+
+    /// Blurs the backdrop behind this element, like CSS `backdrop-filter: blur(radius)`.
+    fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
+    /// Saturates the blurred backdrop, like CSS `backdrop-filter: saturate(factor)`.
+    fn backdrop_saturate(mut self, factor: f32) -> Self {
+        self.style().backdrop_saturation = Some(factor);
+        self
+    }
+
+    /// Sets the extra space after every character, like CSS `letter-spacing`.
+    ///
+    /// This value cascades to its child elements.
+    fn letter_spacing(mut self, spacing: impl Into<LetterSpacing>) -> Self {
+        self.text_style().letter_spacing = Some(spacing.into());
         self
     }
 

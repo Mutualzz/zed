@@ -850,6 +850,8 @@ impl MetalRenderer {
                     }
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                // Backdrop blur is only implemented by the DirectX renderer.
+                PrimitiveBatch::BackdropBlurs(_) => {}
             }
         }
 

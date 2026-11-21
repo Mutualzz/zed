@@ -7,7 +7,8 @@ cbuffer GlobalParams: register(b0) {
     float subpixel_enhanced_contrast;
     uint is_bgr;
     float depth_scale;
-    uint2 global_pad;
+    uint quad_pass_draws_opaque;
+    uint global_pad;
 };
 
 cbuffer BatchParams: register(b1) {
@@ -317,7 +318,7 @@ PreparedBackground prepare_background(Background background) {
     output.tag = background.tag;
     output.color1 = float4(0.0, 0.0, 0.0, 0.0);
 
-    if (background.tag == 1) {
+    if (background.tag == 1 || background.tag == 4) {
         output.color0 = hsla_to_rgba(background.colors[0].color);
         output.color1 = hsla_to_rgba(background.colors[1].color);
         // Interpolating in Oklab means converting the endpoints once rather
@@ -392,6 +393,30 @@ float4 background_color(PreparedBackground prepared, Background background, Boun
             }
 
             // Dither to reduce banding in gradients (especially dark/alpha).
+            float dither = dither_offset(position);
+            color.rgb += dither * 1.0 / 255.0;
+            color.a   += dither * 1.5 / 255.0;
+            break;
+        }
+        case 4: {
+            // Radial gradient: solid holds center.xy and radii.xy as fractions
+            // of the bounds; negative radii mean a circle to the farthest corner.
+            float2 center = bounds.origin + bounds.size * float2(background.solid.h, background.solid.s);
+            float2 radii = bounds.size * float2(background.solid.l, background.solid.a);
+            if (background.solid.l < 0.0) {
+                float2 far_corner = max(abs(center - bounds.origin), abs(bounds.origin + bounds.size - center));
+                float radius = length(far_corner);
+                radii = float2(radius, radius);
+            }
+            float distance = length((position - center) / max(radii, float2(0.0001, 0.0001)));
+            float span = background.colors[1].percentage - background.colors[0].percentage;
+            float t = span == 0.0
+                ? step(background.colors[0].percentage, distance)
+                : saturate((distance - background.colors[0].percentage) / span);
+            color = lerp(prepared.color0, prepared.color1, t);
+            if (background.color_space == 1) {
+                color = oklab_to_srgb(color);
+            }
             float dither = dither_offset(position);
             color.rgb += dither * 1.0 / 255.0;
             color.a   += dither * 1.5 / 255.0;
@@ -534,7 +559,7 @@ QuadFragmentInput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_
     uint quad_id = batch_start_index + instance_id;
     Quad quad = quads[quad_id];
 
-    if (is_opaque_rectangle(quad)) {
+    if (quad_pass_draws_opaque == 0u && is_opaque_rectangle(quad)) {
         QuadFragmentInput culled = (QuadFragmentInput)0;
         culled.position = CULLED_POSITION;
         return culled;
@@ -1369,4 +1394,120 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
     color.a *= input.opacity * saturate(0.5 - distance);
     return color;
+}
+
+/*
+**
+**              Backdrop blur
+**
+*/
+
+cbuffer BackdropParams: register(b2) {
+    float4 backdrop_target_rect;
+    float4 backdrop_source_rect;
+    float4 backdrop_clamp_rect;
+    float4 backdrop_bounds;
+    float4 backdrop_content_mask;
+    float4 backdrop_corner_radii;
+    float2 backdrop_source_size;
+    float2 backdrop_direction;
+    float backdrop_sigma;
+    float backdrop_saturation;
+    float backdrop_opacity;
+    float backdrop_block_size;
+};
+
+struct BackdropFragmentInput {
+    float4 position: SV_Position;
+    float2 source_position: TEXCOORD0;
+};
+
+BackdropFragmentInput backdrop_quad(uint vertex_id) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 target = backdrop_target_rect.xy + unit_vertex * backdrop_target_rect.zw;
+    BackdropFragmentInput output;
+    output.position = float4(target / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    output.source_position = backdrop_source_rect.xy + unit_vertex * backdrop_source_rect.zw;
+    return output;
+}
+
+float4 sample_backdrop(float2 source_pixel) {
+    float2 clamped = clamp(
+        source_pixel,
+        backdrop_clamp_rect.xy + 0.5,
+        backdrop_clamp_rect.xy + backdrop_clamp_rect.zw - 0.5
+    );
+    return t_sprite.SampleLevel(s_sprite, clamped / backdrop_source_size, 0.0);
+}
+
+BackdropFragmentInput backdrop_downsample_vertex(uint vertex_id: SV_VertexID) {
+    return backdrop_quad(vertex_id);
+}
+
+// Averages the block of full-size pixels behind one small pixel with a 4x4
+// grid of bilinear taps (each tap already averages 2x2 pixels).
+float4 backdrop_downsample_fragment(BackdropFragmentInput input): SV_Target {
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll]
+    for (int row = 0; row < 4; row++) {
+        [unroll]
+        for (int column = 0; column < 4; column++) {
+            float2 offset = (float2(column, row) + 0.5) / 4.0 - 0.5;
+            sum += sample_backdrop(input.source_position + offset * backdrop_block_size);
+        }
+    }
+    return sum / 16.0;
+}
+
+BackdropFragmentInput backdrop_blur_vertex(uint vertex_id: SV_VertexID) {
+    return backdrop_quad(vertex_id);
+}
+
+float4 backdrop_blur_fragment(BackdropFragmentInput input): SV_Target {
+    int reach = min((int)ceil(backdrop_sigma * 3.0), 32);
+    float denominator = 2.0 * backdrop_sigma * backdrop_sigma;
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float weight_sum = 0.0;
+    [loop]
+    for (int step = -reach; step <= reach; step++) {
+        float weight = exp(-float(step * step) / denominator);
+        sum += sample_backdrop(input.source_position + backdrop_direction * float(step)) * weight;
+        weight_sum += weight;
+    }
+    return sum / weight_sum;
+}
+
+BackdropFragmentInput backdrop_composite_vertex(uint vertex_id: SV_VertexID) {
+    return backdrop_quad(vertex_id);
+}
+
+float3 saturate_backdrop(float3 color, float amount) {
+    float3x3 matrix_rows = float3x3(
+        0.213 + 0.787 * amount, 0.715 - 0.715 * amount, 0.072 - 0.072 * amount,
+        0.213 - 0.213 * amount, 0.715 + 0.285 * amount, 0.072 - 0.072 * amount,
+        0.213 - 0.213 * amount, 0.715 - 0.715 * amount, 0.072 + 0.928 * amount
+    );
+    return saturate(mul(matrix_rows, color));
+}
+
+float4 backdrop_composite_fragment(BackdropFragmentInput input): SV_Target {
+    float2 position = input.position.xy;
+    float2 mask_end = backdrop_content_mask.xy + backdrop_content_mask.zw;
+    if (any(position < backdrop_content_mask.xy) || any(position > mask_end)) {
+        discard;
+    }
+    Bounds bounds;
+    bounds.origin = backdrop_bounds.xy;
+    bounds.size = backdrop_bounds.zw;
+    Corners corners;
+    corners.top_left = backdrop_corner_radii.x;
+    corners.top_right = backdrop_corner_radii.y;
+    corners.bottom_right = backdrop_corner_radii.z;
+    corners.bottom_left = backdrop_corner_radii.w;
+    float coverage = saturate(0.5 - quad_sdf(position, bounds, corners));
+    if (coverage <= 0.0) {
+        discard;
+    }
+    float4 color = sample_backdrop(input.source_position);
+    return float4(saturate_backdrop(color.rgb, backdrop_saturation), coverage * backdrop_opacity);
 }

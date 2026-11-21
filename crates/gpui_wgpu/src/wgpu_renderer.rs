@@ -1543,6 +1543,8 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Backdrop blur is only implemented by the DirectX renderer.
+                    PrimitiveBatch::BackdropBlurs(_blurs) => {}
                 }
             }
         }

@@ -403,7 +403,7 @@ fn prepare_background(background: Background) -> PreparedBackground {
     result.tag = background.tag;
     result.color1 = vec4<f32>(0.0);
 
-    if (background.tag == 1u) {
+    if (background.tag == 1u || background.tag == 4u) {
         // `hsla_to_rgba` returns linear sRGB. Converting the endpoints to the
         // interpolation space once avoids converting at every stop evaluation.
         result.color0 = hsla_to_rgba(background.colors[0].color);
@@ -481,6 +481,31 @@ fn background_color(prepared: PreparedBackground, background: Background, bounds
             }
 
             // Dither to reduce banding in gradients (especially dark/alpha).
+            let dither = dither_offset(position);
+            color = vec4<f32>(color.rgb + dither * 1.0 / 255.0, color.a + dither * 1.5 / 255.0);
+        }
+        case 4u: {
+            // Radial gradient: solid holds center.xy and radii.xy as fractions
+            // of the bounds; negative radii mean a circle to the farthest corner.
+            let center = bounds.origin + bounds.size * vec2<f32>(background.solid.h, background.solid.s);
+            var radii = bounds.size * vec2<f32>(background.solid.l, background.solid.a);
+            if (background.solid.l < 0.0) {
+                let far_corner = max(abs(center - bounds.origin), abs(bounds.origin + bounds.size - center));
+                let radius = length(far_corner);
+                radii = vec2<f32>(radius, radius);
+            }
+            let distance = length((position - center) / max(radii, vec2<f32>(0.0001)));
+            let span = background.colors[1].percentage - background.colors[0].percentage;
+            var t = step(background.colors[0].percentage, distance);
+            if (span != 0.0) {
+                t = saturate((distance - background.colors[0].percentage) / span);
+            }
+            color = mix(prepared.color0, prepared.color1, t);
+            if (background.color_space == 1u) {
+                color = oklab_to_linear_srgb(color);
+            } else {
+                color = srgba_to_linear(color);
+            }
             let dither = dither_offset(position);
             color = vec4<f32>(color.rgb + dither * 1.0 / 255.0, color.a + dither * 1.5 / 255.0);
         }

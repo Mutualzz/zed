@@ -1277,6 +1277,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    zoom: f32,
     pub(crate) bounds_observers: SingleSubscriberSet<AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SingleSubscriberSet<AnyObserver>,
@@ -2432,6 +2433,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom: 1.0,
             bounds_observers: SingleSubscriberSet::new(),
             appearance,
             appearance_observers: SingleSubscriberSet::new(),
@@ -2833,7 +2835,14 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        match region {
+            Some(region) if self.zoom != 1.0 => {
+                let zoomed: Vec<Bounds<Pixels>> =
+                    region.iter().map(|bounds| self.zoom_bounds(*bounds)).collect();
+                self.platform_window.set_input_region(Some(&zoomed));
+            }
+            region => self.platform_window.set_input_region(region),
+        }
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -3116,11 +3125,11 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.scale_factor = self.platform_window.scale_factor() * self.zoom;
+        self.viewport_size = self.unzoom_size(self.platform_window.content_size());
         self.last_window_bounds = self.platform_window.window_bounds();
         cx.sync_window_update_entry(self);
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_position = self.unzoom_point(self.platform_window.mouse_position());
 
         self.refresh();
 
@@ -3283,7 +3292,7 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds()
+        self.unzoom_bounds(self.platform_window.visual_viewport_bounds())
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -3291,7 +3300,11 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective();
+        let insets = self
+            .platform_window
+            .insets()
+            .effective()
+            .map(|value| *value / self.zoom);
         let viewport = self.viewport_size();
         let left = insets.left.max(Pixels::ZERO).min(viewport.width);
         let top = insets.top.max(Pixels::ZERO).min(viewport.height);
@@ -3344,7 +3357,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(self.zoom_point(position))
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3449,6 +3463,133 @@ impl Window {
     /// be rendered as two pixels on screen.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// The page zoom factor applied on top of the display scale factor, like a
+    /// browser's page zoom. Logical pixels are multiplied by this factor when
+    /// drawn and the viewport shrinks by it.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Sets the page zoom factor (1.0 = no zoom). Values that are not finite or
+    /// not positive are ignored.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        if !zoom.is_finite() || zoom <= 0.0 || zoom == self.zoom {
+            return;
+        }
+        let platform_mouse_position = self.zoom_point(self.mouse_position);
+        self.zoom = zoom;
+        self.scale_factor = self.platform_window.scale_factor() * zoom;
+        self.viewport_size = self.unzoom_size(self.platform_window.content_size());
+        self.mouse_position = self.unzoom_point(platform_mouse_position);
+        self.refresh();
+    }
+
+    /// Converts a point from platform window coordinates to zoomed window coordinates.
+    pub fn unzoom_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        point.map(|value| value / self.zoom)
+    }
+
+    /// Converts a point from zoomed window coordinates to platform window coordinates.
+    pub fn zoom_point(&self, point: Point<Pixels>) -> Point<Pixels> {
+        point.map(|value| value * self.zoom)
+    }
+
+    fn unzoom_size(&self, size: Size<Pixels>) -> Size<Pixels> {
+        size.map(|value| value / self.zoom)
+    }
+
+    /// Converts bounds from zoomed window coordinates to platform window coordinates.
+    pub fn zoom_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.zoom_point(bounds.origin),
+            size: bounds.size.map(|value| value * self.zoom),
+        }
+    }
+
+    fn unzoom_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.unzoom_point(bounds.origin),
+            size: self.unzoom_size(bounds.size),
+        }
+    }
+
+    fn unzoom_input(&self, event: PlatformInput) -> PlatformInput {
+        if self.zoom == 1.0 {
+            return event;
+        }
+        let zoom = self.zoom;
+        let unzoom = |point: Point<Pixels>| point.map(|value| value / zoom);
+        match event {
+            PlatformInput::MouseDown(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::MouseDown(event)
+            }
+            PlatformInput::MouseUp(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::MouseUp(event)
+            }
+            PlatformInput::MousePressure(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::MousePressure(event)
+            }
+            PlatformInput::MouseMove(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::MouseMove(event)
+            }
+            PlatformInput::MouseExited(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::MouseExited(event)
+            }
+            PlatformInput::Scroll(mut event) => {
+                event.position = unzoom(event.position);
+                if let crate::ScrollDelta::Pixels(delta) = event.delta {
+                    event.delta = crate::ScrollDelta::Pixels(unzoom(delta));
+                }
+                PlatformInput::Scroll(event)
+            }
+            PlatformInput::Pinch(mut event) => {
+                event.position = unzoom(event.position);
+                PlatformInput::Pinch(event)
+            }
+            PlatformInput::LongPress(mut event) => {
+                event.start_position = unzoom(event.start_position);
+                event.position = unzoom(event.position);
+                PlatformInput::LongPress(event)
+            }
+            PlatformInput::TouchDrag(mut event) => {
+                event.start_position = unzoom(event.start_position);
+                event.position = unzoom(event.position);
+                PlatformInput::TouchDrag(event)
+            }
+            PlatformInput::BackGesture(mut event) => {
+                event.start_position = unzoom(event.start_position);
+                PlatformInput::BackGesture(event)
+            }
+            PlatformInput::Touch(mut event) => {
+                event.position = unzoom(event.position);
+                event.predicted_position = event.predicted_position.map(unzoom);
+                PlatformInput::Touch(event)
+            }
+            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }) => {
+                PlatformInput::FileDrop(FileDropEvent::Entered {
+                    position: unzoom(position),
+                    paths,
+                })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Pending {
+                    position: unzoom(position),
+                })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Submit {
+                    position: unzoom(position),
+                })
+            }
+            other => other,
+        }
     }
 
     /// Overrides the display scale factor for tests.
@@ -5046,6 +5187,32 @@ impl Window {
         )
     }
 
+    /// Blurs everything painted so far behind `bounds`, like CSS
+    /// `backdrop-filter: blur(radius) saturate(saturation)`.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        radius: Pixels,
+        saturation: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+        if radius <= Pixels::ZERO {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let blur = crate::BackdropBlur {
+            order: 0,
+            radius: radius.scale(scale_factor),
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            saturation,
+            opacity: self.element_opacity(),
+        };
+        self.next_frame.scene.insert_primitive(blur);
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -6076,6 +6243,7 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let event = self.unzoom_input(event);
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -7136,6 +7304,7 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
+                    let bounds = window.zoom_bounds(bounds);
                     window.platform_window.update_ime_position(bounds);
                 }
                 window.platform_window.set_input_handler(input_handler);
@@ -9177,6 +9346,56 @@ mod tests {
                 (scale_factor, expected_bounds, resized_size)
             );
         }
+    }
+
+    #[test]
+    fn test_zoom_scales_drawing_and_shrinks_the_viewport() {
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle: AnyWindowHandle = window.into();
+        let state = |cx: &mut TestAppContext| {
+            cx.update_window(handle, |_, window, _| {
+                (window.zoom(), window.scale_factor(), window.viewport_size())
+            })
+            .unwrap()
+        };
+        let (_, platform_scale, platform_size) = state(&mut cx);
+
+        cx.update_window(handle, |_, window, _| window.set_zoom(2.0))
+            .unwrap();
+        assert_eq!(
+            state(&mut cx),
+            (2.0, platform_scale * 2.0, platform_size.map(|value| value / 2.0))
+        );
+
+        let resized = size(px(800.), px(600.));
+        cx.simulate_window_resize(handle, resized);
+        assert_eq!(
+            state(&mut cx),
+            (2.0, platform_scale * 2.0, size(px(400.), px(300.)))
+        );
+
+        let converted = cx
+            .update_window(handle, |_, window, _| {
+                (
+                    window.unzoom_point(point(px(100.), px(50.))),
+                    window.zoom_bounds(Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)))),
+                )
+            })
+            .unwrap();
+        assert_eq!(converted.0, point(px(50.), px(25.)));
+        assert_eq!(
+            converted.1,
+            Bounds::new(point(px(20.), px(40.)), size(px(60.), px(80.)))
+        );
+
+        cx.update_window(handle, |_, window, _| {
+            window.set_zoom(0.0);
+            window.set_zoom(f32::NAN);
+            window.set_zoom(1.0);
+        })
+        .unwrap();
+        assert_eq!(state(&mut cx), (1.0, platform_scale, resized));
     }
 
     #[gpui::test]

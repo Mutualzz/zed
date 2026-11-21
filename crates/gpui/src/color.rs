@@ -747,6 +747,7 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    RadialGradient = 4,
 }
 
 /// A color space for color interpolation.
@@ -804,6 +805,11 @@ impl std::fmt::Debug for Background {
                 f,
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
+            ),
+            BackgroundTag::RadialGradient => write!(
+                f,
+                "RadialGradient(center {}, {}, radii {}, {}, {:?}, {:?})",
+                self.solid.h, self.solid.s, self.solid.l, self.solid.a, self.colors[0], self.colors[1]
             ),
         }
     }
@@ -875,6 +881,36 @@ pub fn linear_gradient(
     }
 }
 
+/// Creates a radial gradient background, like CSS `radial-gradient`.
+///
+/// `center` is a fraction of the element's size (`point(0.5, 0.5)` is the middle).
+/// `radii` are the ending ellipse's horizontal and vertical radii as fractions of
+/// the element's width and height (CSS `radial-gradient(90% 120% at …)`), or
+/// `None` for a circle reaching the farthest corner (CSS `circle`). The stops'
+/// percentages run from the center (0.0) to the ending shape (1.0).
+pub fn radial_gradient(
+    center: crate::Point<f32>,
+    radii: Option<crate::Size<f32>>,
+    from: impl Into<LinearColorStop>,
+    to: impl Into<LinearColorStop>,
+) -> Background {
+    let (radius_x, radius_y) = match radii {
+        Some(radii) => (radii.width, radii.height),
+        None => (-1.0, -1.0),
+    };
+    Background {
+        tag: BackgroundTag::RadialGradient,
+        solid: Hsla {
+            h: center.x,
+            s: center.y,
+            l: radius_x,
+            a: radius_y,
+        },
+        colors: [from.into(), to.into()],
+        ..Default::default()
+    }
+}
+
 /// A color stop in a linear gradient.
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/CSS/gradient/linear-gradient#linear-color-stop>
@@ -928,7 +964,9 @@ impl Background {
     /// Returns a new background color with the same hue, saturation, and lightness, but with a modified alpha value.
     pub fn opacity(&self, factor: f32) -> Self {
         let mut background = *self;
-        background.solid = background.solid.opacity(factor);
+        if self.tag != BackgroundTag::RadialGradient {
+            background.solid = background.solid.opacity(factor);
+        }
         background.colors = [
             self.colors[0].opacity(factor),
             self.colors[1].opacity(factor),
@@ -940,7 +978,9 @@ impl Background {
     pub fn is_transparent(&self) -> bool {
         match self.tag {
             BackgroundTag::Solid => self.solid.is_transparent(),
-            BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
+            BackgroundTag::LinearGradient | BackgroundTag::RadialGradient => {
+                self.colors.iter().all(|c| c.color.is_transparent())
+            }
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
         }
@@ -972,6 +1012,36 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn radial_gradient_keeps_its_geometry_through_opacity() {
+        let background = radial_gradient(
+            crate::point(0.12, -0.1),
+            Some(crate::size(0.9, 1.2)),
+            LinearColorStop {
+                color: hsla(0.6, 0.5, 0.5, 0.4),
+                percentage: 0.0,
+            },
+            LinearColorStop {
+                color: hsla(0.0, 0.0, 0.0, 0.0),
+                percentage: 0.58,
+            },
+        );
+        let faded = background.opacity(0.5);
+        assert_eq!(faded.solid, background.solid);
+        assert_eq!(faded.colors[0].color.a, 0.2);
+        assert!(!background.is_transparent());
+        assert!(background.as_solid().is_none());
+
+        let circle = radial_gradient(
+            crate::point(0.5, 0.5),
+            None,
+            LinearColorStop::default(),
+            LinearColorStop::default(),
+        );
+        assert!(circle.solid.l < 0.0);
+        assert!(circle.is_transparent());
+    }
 
     #[test]
     fn test_deserialize_three_value_hex_to_rgba() {

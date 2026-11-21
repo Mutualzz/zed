@@ -8,7 +8,8 @@ use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    LetterSpacing, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
+    Window, black, phi,
     point, px, quad, rems, size,
 };
 use collections::HashSet;
@@ -291,6 +292,12 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// Blur radius of the backdrop behind the element, like CSS `backdrop-filter: blur()`.
+    pub backdrop_blur: Option<Pixels>,
+
+    /// Saturation applied to the blurred backdrop, like CSS `backdrop-filter: saturate()`.
+    pub backdrop_saturation: Option<f32>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -480,6 +487,9 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// Extra space after every character, like CSS `letter-spacing`.
+    pub letter_spacing: LetterSpacing,
 }
 
 impl Default for TextStyle {
@@ -501,6 +511,7 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            letter_spacing: LetterSpacing::default(),
         }
     }
 }
@@ -559,6 +570,7 @@ impl TextStyle {
     pub fn to_run(&self, len: usize) -> TextRun {
         TextRun {
             len,
+            letter_spacing: self.letter_spacing,
             font: Font {
                 family: self.font_family.clone(),
                 features: self.font_features.clone(),
@@ -710,6 +722,15 @@ impl Style {
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
+        if let Some(radius) = self.backdrop_blur {
+            window.paint_backdrop_blur(
+                bounds,
+                corner_radii,
+                radius,
+                self.backdrop_saturation.unwrap_or(1.0),
+            );
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -718,7 +739,7 @@ impl Style {
                     | BackgroundTag::PatternSlash
                     | BackgroundTag::Checkerboard => color.solid,
 
-                    BackgroundTag::LinearGradient => color
+                    BackgroundTag::LinearGradient | BackgroundTag::RadialGradient => color
                         .colors
                         .first()
                         .map(|stop| stop.color)
@@ -806,6 +827,8 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            backdrop_blur: None,
+            backdrop_saturation: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
