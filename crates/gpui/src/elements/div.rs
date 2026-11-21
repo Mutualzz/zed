@@ -43,6 +43,7 @@ use std::{
 };
 
 use super::ImageCacheProvider;
+use super::transition::{StyleTransition, TransitionProperty, TransitionState};
 
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;
@@ -859,6 +860,28 @@ pub trait InteractiveElement: Sized {
         if let Some(key_context) = key_context.try_into().log_err() {
             self.interactivity().key_context = Some(key_context);
         }
+        self
+    }
+
+    /// Animate changes to this element's background, border color, text color and opacity, like
+    /// the CSS `transition` property. Needs an element id, which stores the animation state.
+    fn transition(self, duration: Duration, easing: impl Fn(f32) -> f32 + 'static) -> Self {
+        self.transition_properties(&TransitionProperty::ALL, duration, easing)
+    }
+
+    /// Like [`transition`](Self::transition), but only the given properties animate, like CSS
+    /// `transition-property`.
+    fn transition_properties(
+        mut self,
+        properties: &[TransitionProperty],
+        duration: Duration,
+        easing: impl Fn(f32) -> f32 + 'static,
+    ) -> Self {
+        self.interactivity().transition = Some(StyleTransition {
+            duration,
+            easing: Rc::new(easing),
+            properties: properties.to_vec(),
+        });
         self
     }
 
@@ -2249,6 +2272,7 @@ pub struct Interactivity {
     pub(crate) in_focus_style: Option<Box<StyleRefinement>>,
     pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
     pub(crate) hover_style: Option<Box<StyleRefinement>>,
+    pub(crate) transition: Option<StyleTransition>,
     pub(crate) group_hover_style: Option<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
     pub(crate) group_active_style: Option<GroupStyle>,
@@ -2619,7 +2643,19 @@ impl Interactivity {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
 
-                let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
+                let mut style =
+                    self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
+                if let (Some(transition), Some(element_state)) =
+                    (self.transition.as_ref(), element_state.as_mut())
+                    && TransitionState::apply(
+                        &mut element_state.transition,
+                        transition,
+                        &mut style,
+                        cx.background_executor().now(),
+                    )
+                {
+                    window.request_animation_frame();
+                }
 
                 #[cfg(any(test, all(debug_assertions, feature = "test-support")))]
                 if let Some(debug_selector) = &self.debug_selector {
@@ -3729,6 +3765,7 @@ pub struct InteractiveElementState {
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     long_press_tooltip_active: Option<Rc<Cell<bool>>>,
+    pub(crate) transition: Option<TransitionState>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.

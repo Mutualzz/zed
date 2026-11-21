@@ -496,6 +496,42 @@ mod easing {
         delta * delta
     }
 
+    fn cubic_bezier_coordinate(progress: f32, first: f32, second: f32) -> f32 {
+        let inverse = 1.0 - progress;
+        3.0 * inverse * inverse * progress * first
+            + 3.0 * inverse * progress * progress * second
+            + progress * progress * progress
+    }
+
+    fn cubic_bezier_slope(progress: f32, first: f32, second: f32) -> f32 {
+        let inverse = 1.0 - progress;
+        3.0 * inverse * inverse * first
+            + 6.0 * inverse * progress * (second - first)
+            + 3.0 * progress * progress * (1.0 - second)
+    }
+
+    /// A CSS `cubic-bezier(x1, y1, x2, y2)` timing function.
+    pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> impl Fn(f32) -> f32 {
+        move |delta| {
+            let delta = delta.clamp(0.0, 1.0);
+            let mut parameter = delta;
+            for _ in 0..8 {
+                let distance = cubic_bezier_coordinate(parameter, x1, x2) - delta;
+                let slope = cubic_bezier_slope(parameter, x1, x2);
+                if slope.abs() < 1e-6 {
+                    break;
+                }
+                parameter = (parameter - distance / slope).clamp(0.0, 1.0);
+            }
+            cubic_bezier_coordinate(parameter, y1, y2)
+        }
+    }
+
+    /// The CSS `ease` keyword, `cubic-bezier(0.25, 0.1, 0.25, 1)`.
+    pub fn css_ease(delta: f32) -> f32 {
+        cubic_bezier(0.25, 0.1, 0.25, 1.0)(delta)
+    }
+
     /// The quadratic ease-in-out function, which starts and ends slowly but speeds up in the middle
     pub fn ease_in_out(delta: f32) -> f32 {
         if delta < 0.5 {
