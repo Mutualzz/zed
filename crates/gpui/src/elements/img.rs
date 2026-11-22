@@ -46,6 +46,31 @@ pub enum ImageSource {
     Custom(Arc<dyn Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>>>),
 }
 
+impl ImageSource {
+    /// The element id an `img` without an explicit id uses, so animated images keep their frame
+    /// state between frames (browsers animate every `<img>`). Siblings showing the same source share
+    /// it and animate in sync.
+    fn state_id(&self) -> Option<ElementId> {
+        match self {
+            ImageSource::Resource(Resource::Uri(uri)) => {
+                Some(ElementId::Name(format!("img:{uri}").into()))
+            }
+            ImageSource::Resource(Resource::Path(path)) => Some(ElementId::Path(path.clone())),
+            ImageSource::Resource(Resource::Embedded(path)) => {
+                Some(ElementId::Name(format!("img:{path}").into()))
+            }
+            ImageSource::Render(data) => Some(ElementId::NamedInteger(
+                "img-render".into(),
+                data.id.0 as u64,
+            )),
+            ImageSource::Image(image) => {
+                Some(ElementId::NamedInteger("img-image".into(), image.id()))
+            }
+            ImageSource::Custom(_) => None,
+        }
+    }
+}
+
 fn is_uri(uri: &str) -> bool {
     url::Url::from_str(uri).is_ok()
 }
@@ -263,7 +288,10 @@ impl Element for Img {
     type PrepaintState = Option<Hitbox>;
 
     fn id(&self) -> Option<ElementId> {
-        self.interactivity.element_id.clone()
+        self.interactivity
+            .element_id
+            .clone()
+            .or_else(|| self.source.state_id())
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -886,6 +914,35 @@ mod tests {
             )
         });
         assert_eq!(corner_radius, Some(expected_corner_radius));
+    }
+
+    #[gpui::test]
+    fn images_without_an_id_keep_frame_state(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let image = test_image(3);
+        let state_id = ImageSource::Render(image.clone())
+            .state_id()
+            .expect("render images have a state id");
+        let observed = std::rc::Rc::new(std::cell::Cell::new(None));
+        let observed_frame = observed.clone();
+        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), move |_, _| {
+            div()
+                .child(img(ImageSource::Render(image)))
+                .child(canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        window.with_global_id(state_id, |id, window| {
+                            window.with_element_state::<ImgState, _>(id, |state, _| {
+                                let state = state.expect("id-less img stores frame state");
+                                observed_frame.set(Some(state.frame_index));
+                                ((), state)
+                            });
+                        });
+                    },
+                ))
+                .into_any_element()
+        });
+        assert_eq!(observed.get(), Some(0));
     }
 
     #[gpui::test]
