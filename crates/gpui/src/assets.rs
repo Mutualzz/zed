@@ -104,6 +104,22 @@ impl RenderImage {
     pub fn frame_count(&self) -> usize {
         self.data.len()
     }
+
+    /// A copy of this image with every frame blurred like the CSS `blur()` filter,
+    /// where `sigma` is the standard deviation in image pixels.
+    pub fn blurred(&self, sigma: f32) -> RenderImage {
+        let frames: SmallVec<[Frame; 1]> = self
+            .data
+            .iter()
+            .map(|frame| {
+                let buffer = image::imageops::fast_blur(frame.buffer(), sigma);
+                Frame::from_parts(buffer, frame.left(), frame.top(), frame.delay())
+            })
+            .collect();
+        let mut blurred = RenderImage::new(frames);
+        blurred.scale_factor = self.scale_factor;
+        blurred
+    }
 }
 
 impl fmt::Debug for RenderImage {
@@ -118,6 +134,22 @@ impl fmt::Debug for RenderImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blurred_images_keep_their_size_and_soften_hard_edges() {
+        let mut buffer = image::RgbaImage::new(16, 16);
+        for (column, _row, pixel) in buffer.enumerate_pixels_mut() {
+            let value = if column < 8 { 0 } else { 255 };
+            *pixel = image::Rgba([value, value, value, 255]);
+        }
+        let source = RenderImage::new(vec![Frame::new(buffer)]);
+        let blurred = source.blurred(3.0);
+        assert_eq!(blurred.size(0), source.size(0));
+        assert_ne!(blurred.id, source.id);
+        let bytes = blurred.as_bytes(0).expect("frame");
+        let edge_value = bytes[(8 * 16 + 7) * 4];
+        assert!(edge_value > 0 && edge_value < 255, "{edge_value}");
+    }
     use smallvec::SmallVec;
 
     #[test]

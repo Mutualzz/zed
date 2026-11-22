@@ -1,5 +1,6 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
+    Global, ImageId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
     Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource, SharedString,
     SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_static_image,
@@ -146,11 +147,72 @@ where
     }
 }
 
+const MAX_BLURRED_IMAGES: usize = 4;
+
+type BlurKey = (ImageId, u32);
+
+#[derive(Default)]
+struct BlurredImages {
+    ready: Vec<(BlurKey, Arc<RenderImage>)>,
+    pending: Vec<BlurKey>,
+    evicted: Vec<Arc<RenderImage>>,
+}
+
+impl Global for BlurredImages {}
+
+fn blur_key(image: &RenderImage, sigma: f32) -> BlurKey {
+    (image.id, (sigma * 2.0).round() as u32)
+}
+
+fn blurred_image(
+    source: &Arc<RenderImage>,
+    sigma: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> Arc<RenderImage> {
+    let key = blur_key(source, sigma);
+    if key.1 == 0 {
+        return source.clone();
+    }
+    let evicted = std::mem::take(&mut cx.default_global::<BlurredImages>().evicted);
+    for image in evicted {
+        window.drop_image(image).log_err();
+    }
+    let cache = cx.default_global::<BlurredImages>();
+    if let Some((_key, image)) = cache.ready.iter().find(|(ready_key, _image)| *ready_key == key) {
+        return image.clone();
+    }
+    if cache.pending.contains(&key) {
+        return source.clone();
+    }
+    cache.pending.push(key);
+    let blur_source = source.clone();
+    let blur = cx
+        .background_executor()
+        .spawn(async move { blur_source.blurred(sigma) });
+    cx.spawn(async move |cx| {
+        let blurred = Arc::new(blur.await);
+        cx.update(|cx| {
+            let cache = cx.default_global::<BlurredImages>();
+            cache.pending.retain(|pending_key| *pending_key != key);
+            cache.ready.push((key, blurred));
+            while cache.ready.len() > MAX_BLURRED_IMAGES {
+                let (_key, image) = cache.ready.remove(0);
+                cache.evicted.push(image);
+            }
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+    source.clone()
+}
+
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
     brightness: f32,
     saturation: f32,
+    blur: Pixels,
     object_fit: ObjectFit,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
@@ -162,6 +224,7 @@ impl Default for ImageStyle {
             grayscale: false,
             brightness: 1.0,
             saturation: 1.0,
+            blur: px(0.0),
             object_fit: ObjectFit::Contain,
             loading: None,
             fallback: None,
@@ -189,6 +252,14 @@ pub trait StyledImage: Sized {
     /// Change the image's saturation, like the CSS `saturate()` filter (`1.0` is unchanged).
     fn saturate(mut self, saturation: f32) -> Self {
         self.image_style().saturation = saturation;
+        self
+    }
+
+    /// Blur the image like the CSS `blur()` filter, with the radius in on-screen pixels.
+    /// The blurred copy is computed once in the background and cached; the sharp image
+    /// is shown until it is ready.
+    fn blur(mut self, radius: impl Into<Pixels>) -> Self {
+        self.image_style().blur = radius.into();
         self
     }
 
@@ -532,6 +603,16 @@ impl Element for Img {
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                    let data = if self.style.blur > Pixels::ZERO
+                        && new_bounds.size.width > Pixels::ZERO
+                    {
+                        let image_width = data.size(layout_state.frame_index).width.0 as f32;
+                        let sigma = f32::from(self.style.blur) * image_width
+                            / f32::from(new_bounds.size.width);
+                        blurred_image(&data, sigma, window, cx)
+                    } else {
+                        data
+                    };
                     window
                         .paint_image_with_filter(
                             bounds,
