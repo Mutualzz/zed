@@ -272,12 +272,14 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 24u);
+    var cursor = instance_cursor(instance_id * 26u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
         read_atlas_tile(&cursor),
         read_word(&cursor),
+        read_f32(&cursor),
+        read_f32(&cursor),
         read_f32(&cursor),
         read_bounds(&cursor),
         read_bounds(&cursor),

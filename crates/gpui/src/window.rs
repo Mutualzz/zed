@@ -1638,6 +1638,28 @@ fn default_bounds(
     window_bounds_ctor(Bounds::new(final_origin, base_size))
 }
 
+/// Color filters applied to an image while it is painted, matching the CSS
+/// `grayscale`, `brightness()` and `saturate()` filter functions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageFilter {
+    /// Render the image in grayscale.
+    pub grayscale: bool,
+    /// Multiplier applied to every color channel; `1.0` leaves the image unchanged.
+    pub brightness: f32,
+    /// Saturation multiplier; `0.0` is fully desaturated, `1.0` leaves the image unchanged.
+    pub saturation: f32,
+}
+
+impl Default for ImageFilter {
+    fn default() -> Self {
+        Self {
+            grayscale: false,
+            brightness: 1.0,
+            saturation: 1.0,
+        }
+    }
+}
+
 impl Window {
     pub(crate) fn new(
         handle: AnyWindowHandle,
@@ -5580,6 +5602,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                brightness: 1.0,
+                saturation: 1.0,
             });
         }
         Ok(())
@@ -5689,6 +5713,30 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with_filter(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            ImageFilter {
+                grayscale,
+                ..ImageFilter::default()
+            },
+        )
+    }
+
+    /// Paint an image like [`Window::paint_image`], applying CSS-style `grayscale`,
+    /// `brightness()` and `saturate()` filters to its colors.
+    pub fn paint_image_with_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        filter: ImageFilter,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -5768,7 +5816,9 @@ impl Window {
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
-            grayscale: grayscale.into(),
+            grayscale: filter.grayscale.into(),
+            brightness: filter.brightness,
+            saturation: filter.saturation,
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,

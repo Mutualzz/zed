@@ -242,6 +242,8 @@ fn tile_scene(tile: AtlasTile) -> Scene {
             tile,
             grayscale: PaddedBool32::from(false),
             opacity: 1.0,
+            brightness: 1.0,
+            saturation: 1.0,
             bounds,
             content_mask,
             corner_radii: Corners::default(),

@@ -1318,6 +1318,8 @@ pub struct PolychromeSprite {
     pub tile: AtlasTile,
     pub grayscale: PaddedBool32,
     pub opacity: f32,
+    pub brightness: f32,
+    pub saturation: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,

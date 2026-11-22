@@ -149,6 +149,8 @@ where
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
+    brightness: f32,
+    saturation: f32,
     object_fit: ObjectFit,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
@@ -158,6 +160,8 @@ impl Default for ImageStyle {
     fn default() -> Self {
         Self {
             grayscale: false,
+            brightness: 1.0,
+            saturation: 1.0,
             object_fit: ObjectFit::Contain,
             loading: None,
             fallback: None,
@@ -173,6 +177,18 @@ pub trait StyledImage: Sized {
     /// Set the image to be displayed in grayscale.
     fn grayscale(mut self, grayscale: bool) -> Self {
         self.image_style().grayscale = grayscale;
+        self
+    }
+
+    /// Multiply the image's colors, like the CSS `brightness()` filter (`1.0` is unchanged).
+    fn brightness(mut self, brightness: f32) -> Self {
+        self.image_style().brightness = brightness;
+        self
+    }
+
+    /// Change the image's saturation, like the CSS `saturate()` filter (`1.0` is unchanged).
+    fn saturate(mut self, saturation: f32) -> Self {
+        self.image_style().saturation = saturation;
         self
     }
 
@@ -517,13 +533,17 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with_filter(
                             bounds,
                             new_bounds,
                             corner_radii,
                             data,
                             layout_state.frame_index,
-                            self.style.grayscale,
+                            crate::ImageFilter {
+                                grayscale: self.style.grayscale,
+                                brightness: self.style.brightness,
+                                saturation: self.style.saturation,
+                            },
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {
