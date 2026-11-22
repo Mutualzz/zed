@@ -62,6 +62,7 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     pub backdrop_blurs: Vec<BackdropBlur>,
     animations: Vec<SpriteAnimation>,
+    transform_stack: Vec<(PaintTransform, ContentMask<ScaledPixels>)>,
 }
 
 #[expect(missing_docs)]
@@ -70,6 +71,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.transform_stack.clear();
         self.layers.clear();
         self.paths.clear();
         self.shadows.clear();
@@ -92,6 +94,10 @@ impl Scene {
     ) {
         sprite.animation = SpriteAnimationId(self.animations.len() as u32);
         animation.base_color = sprite.color;
+        if let Some((transform, outer_mask)) = self.transform_stack.last() {
+            sprite.bounds = transform.bounds(sprite.bounds);
+            sprite.content_mask = transform.content_mask(&sprite.content_mask, outer_mask);
+        }
         if self.try_insert_primitive(sprite.into()) {
             self.animations.push(animation);
         }
@@ -166,7 +172,37 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        self.try_insert_primitive(primitive.into());
+        let mut primitive = primitive.into();
+        if let Some((transform, outer_mask)) = self.transform_stack.last() {
+            primitive.apply_paint_transform(*transform, outer_mask);
+        }
+        self.try_insert_primitive(primitive);
+    }
+
+    /// Applies `transform` to every primitive inserted until the matching
+    /// [`Scene::pop_paint_transform`], on top of the transforms already active. Primitives keep
+    /// being clipped by `content_mask`, the clip in effect when the transform starts.
+    pub(crate) fn push_paint_transform(
+        &mut self,
+        transform: PaintTransform,
+        content_mask: ContentMask<ScaledPixels>,
+    ) {
+        let entry = match self.transform_stack.last() {
+            Some((outer, outer_mask)) => (
+                transform.then(*outer),
+                ContentMask {
+                    bounds: outer
+                        .bounds(content_mask.bounds)
+                        .intersect(&outer_mask.bounds),
+                },
+            ),
+            None => (transform, content_mask),
+        };
+        self.transform_stack.push(entry);
+    }
+
+    pub(crate) fn pop_paint_transform(&mut self) {
+        self.transform_stack.pop();
     }
 
     /// Returns whether the primitive was kept, rather than clipped away.
@@ -223,7 +259,9 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface);
             }
-            Primitive::BackdropBlur(blur) => self.backdrop_blurs.push(BackdropBlur { order, ..blur }),
+            Primitive::BackdropBlur(blur) => {
+                self.backdrop_blurs.push(BackdropBlur { order, ..blur })
+            }
         }
     }
 
@@ -238,7 +276,7 @@ impl Scene {
                     {
                         self.insert_animated_sprite(*sprite, *animation);
                     } else {
-                        self.insert_primitive(primitive.clone());
+                        self.try_insert_primitive(primitive.clone());
                     }
                 }
                 PaintOperation::StartLayer => self.push_layer(),
@@ -444,6 +482,66 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropBlur(blur) => &blur.bounds,
+        }
+    }
+
+    fn apply_paint_transform(
+        &mut self,
+        transform: PaintTransform,
+        outer_mask: &ContentMask<ScaledPixels>,
+    ) {
+        match self {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = transform.bounds(shadow.bounds);
+                shadow.shape_bounds = transform.bounds(shadow.shape_bounds);
+                shadow.corner_radii = transform.corners(shadow.corner_radii);
+                shadow.shape_corner_radii = transform.corners(shadow.shape_corner_radii);
+                shadow.blur_radius = transform.length(shadow.blur_radius);
+                shadow.content_mask = transform.content_mask(&shadow.content_mask, outer_mask);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = transform.bounds(quad.bounds);
+                quad.corner_radii = transform.corners(quad.corner_radii);
+                quad.border_widths = Edges {
+                    top: transform.length(quad.border_widths.top),
+                    right: transform.length(quad.border_widths.right),
+                    bottom: transform.length(quad.border_widths.bottom),
+                    left: transform.length(quad.border_widths.left),
+                };
+                quad.content_mask = transform.content_mask(&quad.content_mask, outer_mask);
+            }
+            Primitive::Path(_) => {}
+            Primitive::Underline(underline) => {
+                underline.bounds = transform.bounds(underline.bounds);
+                underline.thickness = transform.length(underline.thickness);
+                underline.content_mask =
+                    transform.content_mask(&underline.content_mask, outer_mask);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = transform.bounds(sprite.bounds);
+                sprite.transformation = transform.conjugate(sprite.transformation);
+                sprite.content_mask = transform.content_mask(&sprite.content_mask, outer_mask);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = transform.bounds(sprite.bounds);
+                sprite.transformation = transform.conjugate(sprite.transformation);
+                sprite.content_mask = transform.content_mask(&sprite.content_mask, outer_mask);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = transform.bounds(sprite.bounds);
+                sprite.corner_radii = transform.corners(sprite.corner_radii);
+                sprite.content_mask = transform.content_mask(&sprite.content_mask, outer_mask);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = transform.bounds(surface.bounds);
+                surface.content_mask = transform.content_mask(&surface.content_mask, outer_mask);
+            }
+            Primitive::BackdropBlur(blur) => {
+                blur.bounds = transform.bounds(blur.bounds);
+                blur.corner_radii = transform.corners(blur.corner_radii);
+                blur.radius = transform.length(blur.radius);
+                blur.content_mask = transform.content_mask(&blur.content_mask, outer_mask);
+            }
         }
     }
 
@@ -898,6 +996,120 @@ pub struct TransformationMatrix {
 
 impl Eq for TransformationMatrix {}
 
+/// A uniform scale followed by a translation, applied to everything an element paints, like
+/// CSS `transform: translate(..) scale(..)`. Maps a point `p` to `p * scale + offset`. Axis
+/// aligned, so rectangles stay rectangles and every primitive can be mapped on the CPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintTransform {
+    /// The scale factor.
+    pub scale: f32,
+    /// The translation applied after scaling, in scaled pixels.
+    pub offset: Point<ScaledPixels>,
+}
+
+impl PaintTransform {
+    /// Scales by `scale` around `origin`, then moves by `translate`.
+    pub fn around(origin: Point<ScaledPixels>, scale: f32, translate: Point<ScaledPixels>) -> Self {
+        Self {
+            scale,
+            offset: Point::new(
+                ScaledPixels(origin.x.0 * (1.0 - scale) + translate.x.0),
+                ScaledPixels(origin.y.0 * (1.0 - scale) + translate.y.0),
+            ),
+        }
+    }
+
+    /// Whether the transform leaves everything where it is.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.offset.x.0 == 0.0 && self.offset.y.0 == 0.0
+    }
+
+    /// The transform that applies `self` first, then `outer`.
+    pub fn then(self, outer: PaintTransform) -> Self {
+        Self {
+            scale: self.scale * outer.scale,
+            offset: Point::new(
+                ScaledPixels(self.offset.x.0 * outer.scale + outer.offset.x.0),
+                ScaledPixels(self.offset.y.0 * outer.scale + outer.offset.y.0),
+            ),
+        }
+    }
+
+    /// Maps a point.
+    pub fn point(&self, point: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        Point::new(
+            ScaledPixels(point.x.0 * self.scale + self.offset.x.0),
+            ScaledPixels(point.y.0 * self.scale + self.offset.y.0),
+        )
+    }
+
+    /// Maps a length, which only scales.
+    pub fn length(&self, length: ScaledPixels) -> ScaledPixels {
+        ScaledPixels(length.0 * self.scale)
+    }
+
+    /// Maps bounds.
+    pub fn bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.point(bounds.origin),
+            size: Size {
+                width: self.length(bounds.size.width),
+                height: self.length(bounds.size.height),
+            },
+        }
+    }
+
+    fn corners(&self, corners: Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        Corners {
+            top_left: self.length(corners.top_left),
+            top_right: self.length(corners.top_right),
+            bottom_right: self.length(corners.bottom_right),
+            bottom_left: self.length(corners.bottom_left),
+        }
+    }
+
+    fn content_mask(
+        &self,
+        mask: &ContentMask<ScaledPixels>,
+        outer_mask: &ContentMask<ScaledPixels>,
+    ) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: self.bounds(mask.bounds).intersect(&outer_mask.bounds),
+        }
+    }
+
+    fn matrix(&self) -> TransformationMatrix {
+        TransformationMatrix {
+            rotation_scale: [[self.scale, 0.0], [0.0, self.scale]],
+            translation: [self.offset.x.0, self.offset.y.0],
+        }
+    }
+
+    fn inverse_matrix(&self) -> TransformationMatrix {
+        let inverse_scale = if self.scale.abs() <= f32::EPSILON {
+            0.0
+        } else {
+            1.0 / self.scale
+        };
+        TransformationMatrix {
+            rotation_scale: [[inverse_scale, 0.0], [0.0, inverse_scale]],
+            translation: [
+                -self.offset.x.0 * inverse_scale,
+                -self.offset.y.0 * inverse_scale,
+            ],
+        }
+    }
+
+    /// Re-expresses a sprite's own matrix for its transformed bounds, so a rotated sprite still
+    /// rotates around the same point of the transformed element.
+    fn conjugate(&self, matrix: TransformationMatrix) -> TransformationMatrix {
+        if matrix == TransformationMatrix::unit() {
+            return matrix;
+        }
+        self.matrix().compose(matrix).compose(self.inverse_matrix())
+    }
+}
+
 impl TransformationMatrix {
     /// The unit matrix, has no effect.
     pub fn unit() -> Self {
@@ -1271,6 +1483,83 @@ mod tests {
             saturation: 1.0,
             opacity: 1.0,
         }
+    }
+
+    fn window_mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(-1000.), ScaledPixels(-1000.)),
+                size: size(ScaledPixels(4000.), ScaledPixels(4000.)),
+            },
+        }
+    }
+
+    #[test]
+    fn paint_transforms_scale_around_the_origin_and_compose() {
+        let mut scene = Scene::default();
+        let lift = PaintTransform::around(
+            point(ScaledPixels(5.), ScaledPixels(5.)),
+            2.0,
+            point(ScaledPixels(0.), ScaledPixels(-1.)),
+        );
+        scene.push_paint_transform(lift, window_mask());
+        scene.insert_primitive(Quad {
+            corner_radii: Corners::all(ScaledPixels(2.)),
+            content_mask: window_mask(),
+            ..quad(0.)
+        });
+        scene.push_paint_transform(
+            PaintTransform::around(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                0.5,
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+            ),
+            window_mask(),
+        );
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            ..quad(0.)
+        });
+        scene.pop_paint_transform();
+        scene.pop_paint_transform();
+        scene.insert_primitive(quad(20.));
+        scene.finish();
+        let bounds: Vec<Bounds<ScaledPixels>> =
+            scene.quads.iter().map(|quad| quad.bounds).collect();
+        assert_eq!(
+            bounds[0],
+            Bounds {
+                origin: point(ScaledPixels(-5.), ScaledPixels(-6.)),
+                size: size(ScaledPixels(20.), ScaledPixels(20.)),
+            }
+        );
+        assert_eq!(scene.quads[0].corner_radii.top_left, ScaledPixels(4.));
+        assert_eq!(
+            bounds[1],
+            Bounds {
+                origin: point(ScaledPixels(-5.), ScaledPixels(-6.)),
+                size: size(ScaledPixels(10.), ScaledPixels(10.)),
+            }
+        );
+        assert_eq!(bounds[2], square(20.));
+    }
+
+    #[test]
+    fn transformed_primitives_stay_inside_the_clip_from_before_the_transform() {
+        let mut scene = Scene::default();
+        let clip = ContentMask { bounds: square(0.) };
+        scene.push_paint_transform(
+            PaintTransform::around(
+                point(ScaledPixels(5.), ScaledPixels(5.)),
+                2.0,
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+            ),
+            clip,
+        );
+        scene.insert_primitive(quad(0.));
+        scene.pop_paint_transform();
+        scene.finish();
+        assert_eq!(scene.quads[0].content_mask.bounds, clip.bounds);
     }
 
     #[test]

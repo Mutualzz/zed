@@ -7,10 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    LetterSpacing, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
-    Window, black, phi,
-    point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, LetterSpacing,
+    PaintTransform, Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement,
+    Styled, TextRun, Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -308,6 +307,11 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// Scale and translation applied when painting this element and its children, like CSS
+    /// `transform: translate(..) scale(..)` with the default centre origin. Layout and hit
+    /// testing keep the untransformed bounds.
+    pub transform: Option<ElementTransform>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -349,6 +353,40 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// A scale and translation applied when painting, like CSS `transform: translate(..) scale(..)`
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ElementTransform {
+    /// The uniform scale factor, like CSS `scale(..)`.
+    pub scale: f32,
+    /// The translation, like CSS `translate(..)`.
+    pub translate: Point<Pixels>,
+}
+
+impl Default for ElementTransform {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            translate: Point::default(),
+        }
+    }
+}
+
+impl ElementTransform {
+    /// Whether the transform leaves the element where it is.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.translate == Point::default()
+    }
+
+    /// The paint transform for an element with `bounds`, scaling around its centre.
+    pub fn paint_transform(&self, bounds: Bounds<Pixels>, scale_factor: f32) -> PaintTransform {
+        PaintTransform::around(
+            bounds.center().scale(scale_factor),
+            self.scale,
+            self.translate.scale(scale_factor),
+        )
+    }
 }
 
 /// The possible values of the box-shadow property
@@ -832,6 +870,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

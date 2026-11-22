@@ -768,6 +768,22 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Scales this element and its children around their centre when painting, like CSS
+    /// `transform: scale(factor)`. Layout is unchanged.
+    fn scale(mut self, factor: f32) -> Self {
+        let transform = self.style().transform.get_or_insert_with(Default::default);
+        transform.scale = factor;
+        self
+    }
+
+    /// Moves this element and its children when painting, like CSS
+    /// `transform: translate(x, y)`. Layout is unchanged.
+    fn translate(mut self, x: impl Into<crate::Pixels>, y: impl Into<crate::Pixels>) -> Self {
+        let transform = self.style().transform.get_or_insert_with(Default::default);
+        transform.translate = crate::point(x.into(), y.into());
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {

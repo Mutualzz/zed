@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use scheduler::Instant;
 
-use crate::{Background, BoxShadow, Fill, Hsla, Pixels, Rgba, Style, point, px};
+use crate::{Background, BoxShadow, ElementTransform, Fill, Hsla, Pixels, Rgba, Style, point, px};
 
 /// A style property that [`StyleTransition`] can animate, like CSS `transition-property`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,16 +18,19 @@ pub enum TransitionProperty {
     Opacity,
     /// The box shadows.
     BoxShadow,
+    /// The paint transform (scale and translation).
+    Transform,
 }
 
 impl TransitionProperty {
     /// Every animatable property, like CSS `transition: all`.
-    pub const ALL: [TransitionProperty; 5] = [
+    pub const ALL: [TransitionProperty; 6] = [
         TransitionProperty::Background,
         TransitionProperty::BorderColor,
         TransitionProperty::TextColor,
         TransitionProperty::Opacity,
         TransitionProperty::BoxShadow,
+        TransitionProperty::Transform,
     ];
 }
 
@@ -55,6 +58,7 @@ pub(crate) struct TransitionValues {
     text_color: Option<Hsla>,
     opacity: f32,
     box_shadow: Vec<BoxShadow>,
+    transform: ElementTransform,
 }
 
 impl TransitionValues {
@@ -69,6 +73,7 @@ impl TransitionValues {
             text_color: style.text.color,
             opacity: style.opacity.unwrap_or(1.0),
             box_shadow: style.box_shadow.clone(),
+            transform: style.transform.clone().unwrap_or_default(),
         }
     }
 
@@ -93,6 +98,9 @@ impl TransitionValues {
         }
         if !style.box_shadow.is_empty() || !self.box_shadow.is_empty() {
             style.box_shadow = self.box_shadow.clone();
+        }
+        if style.transform.is_some() || !self.transform.is_identity() {
+            style.transform = Some(self.transform.clone());
         }
     }
 
@@ -127,12 +135,31 @@ impl TransitionValues {
                 &to.box_shadow,
                 eased(TransitionProperty::BoxShadow),
             ),
+            transform: mix_transform(
+                &from.transform,
+                &to.transform,
+                eased(TransitionProperty::Transform),
+            ),
         }
     }
 }
 
 fn mix_pixels(from: Pixels, to: Pixels, progress: f32) -> Pixels {
     from + (to - from) * progress
+}
+
+fn mix_transform(
+    from: &ElementTransform,
+    to: &ElementTransform,
+    progress: f32,
+) -> ElementTransform {
+    ElementTransform {
+        scale: from.scale + (to.scale - from.scale) * progress,
+        translate: point(
+            mix_pixels(from.translate.x, to.translate.x, progress),
+            mix_pixels(from.translate.y, to.translate.y, progress),
+        ),
+    }
 }
 
 fn faded_shadow(shadow: &BoxShadow) -> BoxShadow {
@@ -165,7 +192,11 @@ fn mix_shadows(from: &[BoxShadow], to: &[BoxShadow], progress: f32) -> Vec<BoxSh
         .zip(&padded_to)
         .any(|(first, second)| first.inset != second.inset)
     {
-        return if progress >= 1.0 { to.to_vec() } else { from.to_vec() };
+        return if progress >= 1.0 {
+            to.to_vec()
+        } else {
+            from.to_vec()
+        };
     }
     padded_from
         .iter()
@@ -263,7 +294,12 @@ impl TransitionState {
             return self.to.clone();
         }
         let linear = elapsed.as_secs_f32() / transition.duration.as_secs_f32();
-        TransitionValues::mix(&self.from, &self.to, (transition.easing)(linear), transition)
+        TransitionValues::mix(
+            &self.from,
+            &self.to,
+            (transition.easing)(linear),
+            transition,
+        )
     }
 }
 
@@ -300,7 +336,8 @@ mod tests {
     fn the_first_style_is_drawn_without_animating() {
         let mut state = None;
         let mut style = style_with_background(black());
-        let animating = TransitionState::apply(&mut state, &transition(), &mut style, Instant::now());
+        let animating =
+            TransitionState::apply(&mut state, &transition(), &mut style, Instant::now());
         assert!(!animating);
         assert_eq!(background(&style), black());
     }
@@ -309,9 +346,19 @@ mod tests {
     fn a_changed_style_eases_from_what_was_drawn() {
         let mut state = None;
         let start = Instant::now();
-        TransitionState::apply(&mut state, &transition(), &mut style_with_background(black()), start);
+        TransitionState::apply(
+            &mut state,
+            &transition(),
+            &mut style_with_background(black()),
+            start,
+        );
         let mut hovered = style_with_background(white());
-        assert!(TransitionState::apply(&mut state, &transition(), &mut hovered, start));
+        assert!(TransitionState::apply(
+            &mut state,
+            &transition(),
+            &mut hovered,
+            start
+        ));
         assert_eq!(background(&hovered), black());
         let mut midway = style_with_background(white());
         TransitionState::apply(
@@ -348,7 +395,12 @@ mod tests {
         };
         let mut state = None;
         let start = Instant::now();
-        TransitionState::apply(&mut state, &only_opacity, &mut style_with_background(black()), start);
+        TransitionState::apply(
+            &mut state,
+            &only_opacity,
+            &mut style_with_background(black()),
+            start,
+        );
         let mut changed = style_with_background(white());
         TransitionState::apply(
             &mut state,
@@ -372,7 +424,37 @@ mod tests {
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].spread_radius, px(2.0));
         assert!((mixed[0].color.a - 0.5).abs() < 0.001);
-        assert_eq!(mix_shadows(std::slice::from_ref(&ring), &[], 1.0)[0].spread_radius, px(0.0));
+        assert_eq!(
+            mix_shadows(std::slice::from_ref(&ring), &[], 1.0)[0].spread_radius,
+            px(0.0)
+        );
+    }
+
+    #[test]
+    fn transforms_interpolate_scale_and_translation() {
+        let lifted = ElementTransform {
+            scale: 1.1,
+            translate: point(px(0.0), px(-1.0)),
+        };
+        let midway = mix_transform(&ElementTransform::default(), &lifted, 0.5);
+        assert!((midway.scale - 1.05).abs() < 1e-5);
+        assert_eq!(midway.translate, point(px(0.0), px(-0.5)));
+        let mut state = None;
+        let start = Instant::now();
+        let mut resting = Style::default();
+        TransitionState::apply(&mut state, &transition(), &mut resting, start);
+        let mut hovered = Style {
+            transform: Some(lifted),
+            ..Style::default()
+        };
+        TransitionState::apply(
+            &mut state,
+            &transition(),
+            &mut hovered,
+            start + Duration::from_millis(150),
+        );
+        let drawn = hovered.transform.expect("transform");
+        assert!((drawn.scale - 1.0).abs() < 1e-5, "{}", drawn.scale);
     }
 
     #[test]

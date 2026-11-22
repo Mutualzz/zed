@@ -14,17 +14,18 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintedPath, Path,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style, SubpixelSprite, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
-    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintTransform,
+    PaintedPath, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, SpriteAnimation, SpriteAnimationId, StrikethroughStyle, Style,
+    SubpixelSprite, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -2837,8 +2838,10 @@ impl Window {
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         match region {
             Some(region) if self.zoom != 1.0 => {
-                let zoomed: Vec<Bounds<Pixels>> =
-                    region.iter().map(|bounds| self.zoom_bounds(*bounds)).collect();
+                let zoomed: Vec<Bounds<Pixels>> = region
+                    .iter()
+                    .map(|bounds| self.zoom_bounds(*bounds))
+                    .collect();
                 self.platform_window.set_input_region(Some(&zoomed));
             }
             region => self.platform_window.set_input_region(region),
@@ -4721,6 +4724,26 @@ impl Window {
         self.element_offset_stack.push(offset);
         let result = f(self);
         self.element_offset_stack.pop();
+        result
+    }
+
+    /// Paints everything `f` paints through `transform`: a scale and translation applied to
+    /// every primitive, like CSS `transform`. Paths are not transformed.
+    pub fn with_paint_transform<R>(
+        &mut self,
+        transform: Option<PaintTransform>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let Some(transform) = transform.filter(|transform| !transform.is_identity()) else {
+            return f(self);
+        };
+        let content_mask = self.content_mask().scale(self.scale_factor());
+        self.next_frame
+            .scene
+            .push_paint_transform(transform, content_mask);
+        let result = f(self);
+        self.next_frame.scene.pop_paint_transform();
         result
     }
 
@@ -9365,7 +9388,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             state(&mut cx),
-            (2.0, platform_scale * 2.0, platform_size.map(|value| value / 2.0))
+            (
+                2.0,
+                platform_scale * 2.0,
+                platform_size.map(|value| value / 2.0)
+            )
         );
 
         let resized = size(px(800.), px(600.));
@@ -9379,7 +9406,8 @@ mod tests {
             .update_window(handle, |_, window, _| {
                 (
                     window.unzoom_point(point(px(100.), px(50.))),
-                    window.zoom_bounds(Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)))),
+                    window
+                        .zoom_bounds(Bounds::new(point(px(10.), px(20.)), size(px(30.), px(40.)))),
                 )
             })
             .unwrap();
