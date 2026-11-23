@@ -654,6 +654,13 @@ impl Window {
         !self.text_selection.is_empty()
     }
 
+    /// Whether the position is on the glyphs of selectable, unoccluded text, rather than on the
+    /// blank part of a text element's box (the space after a short line or below the last one).
+    pub fn is_over_text(&self, position: Point<Pixels>) -> bool {
+        self.text_under_mouse(position)
+            .is_some_and(|text| text.layout.index_for_position(position).is_ok())
+    }
+
     /// Removes the current mouse text selection.
     pub fn clear_text_selection(&mut self) {
         if self.text_selection.clear() {
@@ -719,6 +726,33 @@ mod tests {
         );
         assert_eq!(cursor_at(point(px(2.), px(50.)), cx), CursorStyle::Arrow);
         assert_eq!(cursor_at(point(px(2.), px(70.)), cx), CursorStyle::Arrow);
+    }
+
+    fn over_text_at(position: crate::Point<crate::Pixels>, cx: &mut TestAppContext) -> bool {
+        let window = cx.add_window(|_, _| Labels);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.hovered.set(true);
+            window.active.set(true);
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.is_over_text(position)
+        })
+        .expect("window updates")
+    }
+
+    #[crate::test]
+    fn only_glyphs_of_selectable_text_count_as_text(cx: &mut TestAppContext) {
+        assert!(over_text_at(point(px(2.), px(10.)), cx));
+        assert!(!over_text_at(point(px(600.), px(10.)), cx));
+        assert!(!over_text_at(point(px(2.), px(50.)), cx));
+        assert!(!over_text_at(point(px(2.), px(70.)), cx));
     }
 
     #[test]
