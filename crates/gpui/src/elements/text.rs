@@ -1,8 +1,8 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextAlign,
+    TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -273,10 +273,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window)
     }
 
     fn paint(
@@ -339,10 +339,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window)
     }
 
     fn paint(
@@ -557,10 +557,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text, window)
     }
 
     fn paint(
@@ -596,6 +596,65 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    selection: SelectionMetrics,
+}
+
+#[derive(Clone, Copy)]
+struct SelectionMetrics {
+    hitbox_floor: usize,
+    text_align: TextAlign,
+    selectable: bool,
+}
+
+impl Default for SelectionMetrics {
+    fn default() -> Self {
+        Self {
+            hitbox_floor: 0,
+            text_align: TextAlign::Left,
+            selectable: true,
+        }
+    }
+}
+
+struct WrappedRow {
+    start_index: usize,
+    end_index: usize,
+    start_x: Pixels,
+    end_x: Pixels,
+}
+
+fn wrapped_rows(line: &WrappedLine) -> SmallVec<[WrappedRow; 1]> {
+    let layout = &line.layout.unwrapped_layout;
+    let mut rows = SmallVec::new();
+    let mut start_index = 0;
+    let mut start_x = Pixels::ZERO;
+    for boundary in line.layout.wrap_boundaries.iter() {
+        let glyph = &layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+        rows.push(WrappedRow {
+            start_index,
+            end_index: glyph.index,
+            start_x,
+            end_x: glyph.position.x,
+        });
+        start_index = glyph.index;
+        start_x = glyph.position.x;
+    }
+    rows.push(WrappedRow {
+        start_index,
+        end_index: layout.len,
+        start_x,
+        end_x: layout.width,
+    });
+    rows
+}
+
+fn row_origin_x(row: &WrappedRow, bounds: Bounds<Pixels>, align: TextAlign) -> Pixels {
+    let row_width = row.end_x - row.start_x;
+    match align {
+        TextAlign::Left => bounds.left(),
+        TextAlign::Center => (bounds.left() * 2.0 + bounds.size.width - row_width) / 2.0,
+        TextAlign::Right => bounds.left() + bounds.size.width - row_width,
+    }
 }
 
 fn min_content_size(
@@ -618,7 +677,11 @@ fn min_content_size(
         let mut glyphs: Vec<(usize, Pixels)> = layout
             .runs
             .iter()
-            .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.index, glyph.position.x)))
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(|glyph| (glyph.index, glyph.position.x))
+            })
             .collect();
         glyphs.sort_by_key(|(index, _)| *index);
         let mut word_start = None;
@@ -799,6 +862,7 @@ impl TextLayout {
                         truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
+                        selection: SelectionMetrics::default(),
                     });
                     return Size::default();
                 };
@@ -818,6 +882,7 @@ impl TextLayout {
                     truncate_width,
                     size: Some(size),
                     bounds: None,
+                    selection: SelectionMetrics::default(),
                 });
 
                 size
@@ -825,13 +890,105 @@ impl TextLayout {
         })
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &Window) {
         let mut element_state = self.0.borrow_mut();
         let element_state = element_state
             .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
         element_state.bounds = Some(bounds);
+        let text_style = window.text_style();
+        element_state.selection = SelectionMetrics {
+            hitbox_floor: window.next_frame.hitboxes.len(),
+            text_align: text_style.text_align,
+            selectable: text_style.selectable,
+        };
+    }
+
+    pub(crate) fn selection_index_for_point(&self, position: Point<Pixels>) -> usize {
+        let element_state = self.0.borrow();
+        let Some(element_state) = element_state.as_ref() else {
+            return 0;
+        };
+        let Some(bounds) = element_state.bounds else {
+            return 0;
+        };
+        let line_height = element_state.line_height;
+        let mut row_top = bounds.top();
+        let mut line_start = 0;
+        let line_count = element_state.lines.len();
+        for (line_index, line) in element_state.lines.iter().enumerate() {
+            let rows = wrapped_rows(line);
+            let row_count = rows.len();
+            for (row_index, row) in rows.into_iter().enumerate() {
+                let row_bottom = row_top + line_height;
+                let is_last_row = line_index + 1 == line_count && row_index + 1 == row_count;
+                if position.y < row_bottom || is_last_row {
+                    let origin_x = row_origin_x(&row, bounds, element_state.selection.text_align);
+                    let unwrapped_x = position.x - origin_x + row.start_x;
+                    let index = line
+                        .layout
+                        .unwrapped_layout
+                        .closest_index_for_x(unwrapped_x)
+                        .clamp(row.start_index, row.end_index);
+                    return line_start + index;
+                }
+                row_top = row_bottom;
+            }
+            line_start += line.len() + 1;
+        }
+        0
+    }
+
+    fn paint_selection(
+        &self,
+        line: &WrappedLine,
+        line_start: usize,
+        line_top: Pixels,
+        selection: &Range<usize>,
+        window: &mut Window,
+    ) {
+        let element_state = self.0.borrow();
+        let Some(element_state) = element_state.as_ref() else {
+            return;
+        };
+        let Some(bounds) = element_state.bounds else {
+            return;
+        };
+        let line_end = line_start + line.len();
+        if selection.end < line_start || selection.start > line_end {
+            return;
+        }
+        let local_start = selection.start.saturating_sub(line_start).min(line.len());
+        let local_end = (selection.end - line_start).min(line.len());
+        let continues_past_line = selection.end > line_end;
+        let line_height = element_state.line_height;
+        let layout = &line.layout.unwrapped_layout;
+        let color = window.text_selection.color;
+        let rows = wrapped_rows(line);
+        let row_count = rows.len();
+        for (row_index, row) in rows.into_iter().enumerate() {
+            let segment_start = local_start.max(row.start_index);
+            let segment_end = local_end.min(row.end_index);
+            let extends_newline = continues_past_line && row_index + 1 == row_count;
+            if segment_start > segment_end || (segment_start == segment_end && !extends_newline) {
+                continue;
+            }
+            let origin_x = row_origin_x(&row, bounds, element_state.selection.text_align);
+            let left = origin_x + layout.x_for_index(segment_start) - row.start_x;
+            let mut right = origin_x + layout.x_for_index(segment_end) - row.start_x;
+            if extends_newline {
+                right += Window::text_selection_newline_extension(layout.font_size);
+            }
+            let top = line_top + line_height * row_index as f32;
+            window.paint_quad(crate::fill(
+                Bounds::from_corners(
+                    crate::point(left, top),
+                    crate::point(right, top + line_height),
+                ),
+                color,
+            ));
+        }
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
@@ -869,6 +1026,13 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
+        let selection = if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
+            let metrics = element_state.selection;
+            window.register_selectable_text(self, metrics.hitbox_floor, metrics.selectable)
+        } else {
+            None
+        };
+        let mut line_start = 0;
         for line in &element_state.lines {
             if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
                 line.paint_background(
@@ -880,6 +1044,9 @@ impl TextLayout {
                     cx,
                 )
                 .log_err();
+                if let Some(selection) = &selection {
+                    self.paint_selection(line, line_start, line_origin.y, selection, window);
+                }
             }
             if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
                 line.paint(
@@ -893,6 +1060,7 @@ impl TextLayout {
                 .log_err();
             }
             line_origin.y += line.size(line_height).height;
+            line_start += line.len() + 1;
         }
         Ok(())
     }

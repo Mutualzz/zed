@@ -1010,6 +1010,10 @@ impl ElementIdStack {
         self.hashes.clear();
     }
 
+    pub(crate) fn path_hash(&self) -> u64 {
+        self.hash()
+    }
+
     /// The hash of the whole path on the stack.
     fn hash(&self) -> u64 {
         self.hashes
@@ -1071,6 +1075,8 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    pub(crate) selectable_texts: Vec<crate::text_selection::SelectableText>,
+    pub(crate) selectable_text_ordinals: FxHashMap<u64, u32>,
 }
 
 #[derive(Clone, Default)]
@@ -1094,6 +1100,7 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+    selectable_texts_index: usize,
 }
 
 impl Frame {
@@ -1130,6 +1137,8 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            selectable_texts: Vec::new(),
+            selectable_text_ordinals: FxHashMap::default(),
         }
     }
 
@@ -1146,6 +1155,8 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.selectable_texts.clear();
+        self.selectable_text_ordinals.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1272,9 +1283,10 @@ pub struct Window {
     focus_listeners: SingleSubscriberSet<AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SingleSubscriberSet<AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
-    default_prevented: bool,
-    mouse_position: Point<Pixels>,
-    mouse_hit_test: HitTest,
+    pub(crate) default_prevented: bool,
+    pub(crate) text_selection: crate::text_selection::TextSelection,
+    pub(crate) mouse_position: Point<Pixels>,
+    pub(crate) mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1283,11 +1295,11 @@ pub struct Window {
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SingleSubscriberSet<AnyObserver>,
     pub(crate) button_layout_observers: SingleSubscriberSet<AnyObserver>,
-    active: Rc<Cell<bool>>,
+    pub(crate) active: Rc<Cell<bool>>,
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
-    hovered: Rc<Cell<bool>>,
+    pub(crate) hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// The rendered scene's [`Scene::animation_frame_interval`]. While it is
     /// `Some`, the scene must keep being presented even when nothing is redrawn.
@@ -2249,6 +2261,9 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        if !active {
+                            window.text_selection.stop_dragging();
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2444,6 +2459,7 @@ impl Window {
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
+            text_selection: crate::text_selection::TextSelection::default(),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -3985,6 +4001,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
+            self.resolve_text_selection();
             self.draw_roots(cx);
             #[cfg(feature = "profiler")]
             {
@@ -4595,6 +4612,7 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
+            selectable_texts_index: self.next_frame.selectable_texts.len(),
         }
     }
 
@@ -4630,6 +4648,12 @@ impl Window {
                 ..range.end.accessed_element_states_index]
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
+        );
+        self.next_frame.selectable_texts.extend(
+            self.rendered_frame.selectable_texts
+                [range.start.selectable_texts_index..range.end.selectable_texts_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
@@ -6244,6 +6268,7 @@ impl Window {
             let style = cx
                 .active_drag_cursor_style()
                 .or_else(|| self.rendered_frame.cursor_style(self))
+                .or_else(|| self.text_selection_cursor())
                 .unwrap_or(CursorStyle::Arrow);
             cx.platform.set_cursor_style(style);
         }
@@ -6641,7 +6666,7 @@ impl Window {
         });
     }
 
-    fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+    pub(crate) fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
         self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position());
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -6676,6 +6701,8 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+
+        self.handle_text_selection_event(event, cx);
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {

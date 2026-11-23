@@ -56,6 +56,7 @@ mod subscription;
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
+mod text_selection;
 mod text_system;
 mod util;
 mod view;

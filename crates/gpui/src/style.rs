@@ -528,6 +528,9 @@ pub struct TextStyle {
 
     /// Extra space after every character, like CSS `letter-spacing`.
     pub letter_spacing: LetterSpacing,
+
+    /// Whether the text can be selected with the mouse, like CSS `user-select`.
+    pub selectable: bool,
 }
 
 impl Default for TextStyle {
@@ -550,6 +553,7 @@ impl Default for TextStyle {
             text_align: TextAlign::default(),
             line_clamp: None,
             letter_spacing: LetterSpacing::default(),
+            selectable: true,
         }
     }
 }

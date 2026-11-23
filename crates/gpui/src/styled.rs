@@ -84,6 +84,19 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Stops the text inside this element from being selected with the mouse, like CSS
+    /// `user-select: none`. Inherited by children.
+    fn user_select_none(mut self) -> Self {
+        self.text_style().selectable = Some(false);
+        self
+    }
+
+    /// Makes the text inside this element selectable again, like CSS `user-select: text`.
+    fn user_select_text(mut self) -> Self {
+        self.text_style().selectable = Some(true);
+        self
+    }
+
     /// Sets the truncate overflowing text with an ellipsis (…) at the end if needed.
     /// [Docs](https://tailwindcss.com/docs/text-overflow#ellipsis)
     fn text_ellipsis(mut self) -> Self {
