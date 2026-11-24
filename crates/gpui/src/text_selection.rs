@@ -66,6 +66,7 @@ pub(crate) struct TextSelection {
     pieces: Vec<SelectedPiece>,
     block_stack: Vec<Bounds<Pixels>>,
     pub(crate) color: Hsla,
+    pub(crate) text_color: Hsla,
 }
 
 impl Default for TextSelection {
@@ -90,6 +91,7 @@ impl Default for TextSelection {
                 a: 0.8,
             }
             .into(),
+            text_color: crate::white(),
         }
     }
 }

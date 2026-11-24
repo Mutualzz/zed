@@ -1,9 +1,10 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextAlign,
-    TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    ActiveTooltip, AnyView, App, Bounds, ContentMask, DecorationRun, DispatchPhase, Element,
+    ElementId, GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Size, TextAlign, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -597,6 +598,7 @@ struct TextLayoutInner {
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
     selection: SelectionMetrics,
+    selected: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -648,6 +650,148 @@ fn wrapped_rows(line: &WrappedLine) -> SmallVec<[WrappedRow; 1]> {
         end_x: layout.width,
     });
     rows
+}
+
+struct SelectedRow {
+    row_index: usize,
+    left: Pixels,
+    glyphs_right: Pixels,
+    highlight_right: Pixels,
+    whole_row: bool,
+}
+
+fn selected_rows(
+    line: &WrappedLine,
+    line_start: usize,
+    selection: &Range<usize>,
+    bounds: Bounds<Pixels>,
+    align: TextAlign,
+) -> SmallVec<[SelectedRow; 1]> {
+    let mut selected = SmallVec::new();
+    let line_end = line_start + line.len();
+    if selection.end < line_start || selection.start > line_end {
+        return selected;
+    }
+    let local_start = selection.start.saturating_sub(line_start).min(line.len());
+    let local_end = (selection.end - line_start).min(line.len());
+    let continues_past_line = selection.end > line_end;
+    let layout = &line.layout.unwrapped_layout;
+    let rows = wrapped_rows(line);
+    let row_count = rows.len();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let segment_start = local_start.max(row.start_index);
+        let segment_end = local_end.min(row.end_index);
+        let extends_newline = continues_past_line && row_index + 1 == row_count;
+        if segment_start > segment_end || (segment_start == segment_end && !extends_newline) {
+            continue;
+        }
+        let origin_x = row_origin_x(&row, bounds, align);
+        let left = origin_x + layout.x_for_index(segment_start) - row.start_x;
+        let glyphs_right = origin_x + layout.x_for_index(segment_end) - row.start_x;
+        let highlight_right = if extends_newline {
+            glyphs_right + Window::text_selection_newline_extension(layout.font_size)
+        } else {
+            glyphs_right
+        };
+        selected.push(SelectedRow {
+            row_index,
+            left,
+            glyphs_right,
+            highlight_right,
+            whole_row: segment_start == row.start_index && segment_end >= row.end_index,
+        });
+    }
+    selected
+}
+
+const GLYPH_BAND_OVERFLOW_LINES: f32 = 2.0;
+
+fn glyph_bands(
+    row_count: usize,
+    rows: &[SelectedRow],
+    bounds: Bounds<Pixels>,
+    line_top: Pixels,
+    line_height: Pixels,
+) -> SmallVec<[(Bounds<Pixels>, bool); 4]> {
+    let mut bands: SmallVec<[(Bounds<Pixels>, bool); 4]> = SmallVec::new();
+    if rows.iter().all(|row| row.glyphs_right <= row.left) {
+        return bands;
+    }
+    let overflow = line_height * GLYPH_BAND_OVERFLOW_LINES;
+    let far_left = bounds.left() - overflow;
+    let far_right = bounds.right() + overflow;
+    let mut open_full_band: Option<bool> = None;
+    for row_index in 0..row_count {
+        let top = if row_index == 0 {
+            line_top - overflow
+        } else {
+            line_top + line_height * row_index as f32
+        };
+        let bottom = if row_index + 1 == row_count {
+            line_top + line_height * row_count as f32 + overflow
+        } else {
+            line_top + line_height * (row_index + 1) as f32
+        };
+        let row = rows.iter().find(|row| row.row_index == row_index);
+        match row {
+            Some(row) if !row.whole_row => {
+                bands.push((
+                    Bounds::from_corners(
+                        crate::point(far_left, top),
+                        crate::point(row.left, bottom),
+                    ),
+                    false,
+                ));
+                bands.push((
+                    Bounds::from_corners(
+                        crate::point(row.left, top),
+                        crate::point(row.glyphs_right, bottom),
+                    ),
+                    true,
+                ));
+                bands.push((
+                    Bounds::from_corners(
+                        crate::point(row.glyphs_right, top),
+                        crate::point(far_right, bottom),
+                    ),
+                    false,
+                ));
+                open_full_band = None;
+            }
+            _ => {
+                let selected = row.is_some();
+                match bands.last_mut() {
+                    Some((band, _)) if open_full_band == Some(selected) => {
+                        *band = Bounds::from_corners(band.origin, crate::point(far_right, bottom));
+                    }
+                    _ => bands.push((
+                        Bounds::from_corners(
+                            crate::point(far_left, top),
+                            crate::point(far_right, bottom),
+                        ),
+                        selected,
+                    )),
+                }
+                open_full_band = Some(selected);
+            }
+        }
+    }
+    bands
+}
+
+fn recolored_line(line: &WrappedLine, color: Hsla) -> WrappedLine {
+    WrappedLine {
+        layout: line.layout.clone(),
+        text: line.text.clone(),
+        decoration_runs: line
+            .decoration_runs
+            .iter()
+            .map(|run| DecorationRun {
+                color,
+                ..run.clone()
+            })
+            .collect(),
+    }
 }
 
 fn row_origin_x(row: &WrappedRow, bounds: Bounds<Pixels>, align: TextAlign) -> Pixels {
@@ -865,6 +1009,7 @@ impl TextLayout {
                         size: Some(Size::default()),
                         bounds: None,
                         selection: SelectionMetrics::default(),
+                        selected: None,
                     });
                     return Size::default();
                 };
@@ -885,6 +1030,7 @@ impl TextLayout {
                     size: Some(size),
                     bounds: None,
                     selection: SelectionMetrics::default(),
+                    selected: None,
                 });
 
                 size
@@ -943,57 +1089,6 @@ impl TextLayout {
         0
     }
 
-    fn paint_selection(
-        &self,
-        line: &WrappedLine,
-        line_start: usize,
-        line_top: Pixels,
-        selection: &Range<usize>,
-        window: &mut Window,
-    ) {
-        let element_state = self.0.borrow();
-        let Some(element_state) = element_state.as_ref() else {
-            return;
-        };
-        let Some(bounds) = element_state.bounds else {
-            return;
-        };
-        let line_end = line_start + line.len();
-        if selection.end < line_start || selection.start > line_end {
-            return;
-        }
-        let local_start = selection.start.saturating_sub(line_start).min(line.len());
-        let local_end = (selection.end - line_start).min(line.len());
-        let continues_past_line = selection.end > line_end;
-        let line_height = element_state.line_height;
-        let layout = &line.layout.unwrapped_layout;
-        let color = window.text_selection.color;
-        let rows = wrapped_rows(line);
-        let row_count = rows.len();
-        for (row_index, row) in rows.into_iter().enumerate() {
-            let segment_start = local_start.max(row.start_index);
-            let segment_end = local_end.min(row.end_index);
-            let extends_newline = continues_past_line && row_index + 1 == row_count;
-            if segment_start > segment_end || (segment_start == segment_end && !extends_newline) {
-                continue;
-            }
-            let origin_x = row_origin_x(&row, bounds, element_state.selection.text_align);
-            let left = origin_x + layout.x_for_index(segment_start) - row.start_x;
-            let mut right = origin_x + layout.x_for_index(segment_end) - row.start_x;
-            if extends_newline {
-                right += Window::text_selection_newline_extension(layout.font_size);
-            }
-            let top = line_top + line_height * row_index as f32;
-            window.paint_quad(crate::fill(
-                Bounds::from_corners(
-                    crate::point(left, top),
-                    crate::point(right, top + line_height),
-                ),
-                color,
-            ));
-        }
-    }
-
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
         self.paint_lines(TextPaintPass::All, window, cx)
             .with_context(|| format!("failed to paint {text}"))
@@ -1018,6 +1113,24 @@ impl TextLayout {
         window: &mut Window,
         cx: &mut App,
     ) -> anyhow::Result<()> {
+        if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
+            let metrics = self
+                .0
+                .borrow()
+                .as_ref()
+                .map(|element_state| element_state.selection);
+            if let Some(metrics) = metrics {
+                let selected = window.register_selectable_text(
+                    self,
+                    metrics.hitbox_floor,
+                    metrics.selectable,
+                    metrics.block,
+                );
+                if let Some(element_state) = self.0.borrow_mut().as_mut() {
+                    element_state.selected = selected;
+                }
+            }
+        }
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -1029,19 +1142,21 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
         let text_style = window.text_style();
-        let selection = if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
-            let metrics = element_state.selection;
-            window.register_selectable_text(
-                self,
-                metrics.hitbox_floor,
-                metrics.selectable,
-                metrics.block,
-            )
-        } else {
-            None
-        };
         let mut line_start = 0;
         for line in &element_state.lines {
+            let rows = element_state
+                .selected
+                .as_ref()
+                .map(|selection| {
+                    selected_rows(
+                        line,
+                        line_start,
+                        selection,
+                        bounds,
+                        element_state.selection.text_align,
+                    )
+                })
+                .unwrap_or_default();
             if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
                 line.paint_background(
                     line_origin,
@@ -1052,20 +1167,54 @@ impl TextLayout {
                     cx,
                 )
                 .log_err();
-                if let Some(selection) = &selection {
-                    self.paint_selection(line, line_start, line_origin.y, selection, window);
+                let color = window.text_selection.color;
+                for row in &rows {
+                    let top = line_origin.y + line_height * row.row_index as f32;
+                    window.paint_quad(crate::fill(
+                        Bounds::from_corners(
+                            crate::point(row.left, top),
+                            crate::point(row.highlight_right, top + line_height),
+                        ),
+                        color,
+                    ));
                 }
             }
             if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
-                line.paint(
-                    line_origin,
+                let bands = glyph_bands(
+                    wrapped_rows(line).len(),
+                    &rows,
+                    bounds,
+                    line_origin.y,
                     line_height,
-                    text_style.text_align,
-                    Some(bounds),
-                    window,
-                    cx,
-                )
-                .log_err();
+                );
+                if bands.is_empty() {
+                    line.paint(
+                        line_origin,
+                        line_height,
+                        text_style.text_align,
+                        Some(bounds),
+                        window,
+                        cx,
+                    )
+                    .log_err();
+                } else {
+                    let selected_line = recolored_line(line, window.text_selection.text_color);
+                    for (band, selected) in bands {
+                        let target = if selected { &selected_line } else { line };
+                        window.with_content_mask(Some(ContentMask { bounds: band }), |window| {
+                            target
+                                .paint(
+                                    line_origin,
+                                    line_height,
+                                    text_style.text_align,
+                                    Some(bounds),
+                                    window,
+                                    cx,
+                                )
+                                .log_err();
+                        });
+                    }
+                }
             }
             line_origin.y += line.size(line_height).height;
             line_start += line.len() + 1;
@@ -1522,6 +1671,58 @@ impl Element for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn band_row(row_index: usize, left: f32, right: f32, whole_row: bool) -> SelectedRow {
+        SelectedRow {
+            row_index,
+            left: crate::px(left),
+            glyphs_right: crate::px(right),
+            highlight_right: crate::px(right),
+            whole_row,
+        }
+    }
+
+    fn element_bounds() -> Bounds<Pixels> {
+        Bounds::new(
+            crate::point(crate::px(0.), crate::px(0.)),
+            crate::size(crate::px(200.), crate::px(60.)),
+        )
+    }
+
+    #[test]
+    fn unselected_lines_paint_without_bands() {
+        assert!(glyph_bands(3, &[], element_bounds(), crate::px(0.), crate::px(20.)).is_empty());
+    }
+
+    #[test]
+    fn a_partial_row_splits_into_before_selected_and_after() {
+        let rows = [band_row(0, 30., 90., false)];
+        let bands = glyph_bands(1, &rows, element_bounds(), crate::px(0.), crate::px(20.));
+        let states: Vec<bool> = bands.iter().map(|(_, selected)| *selected).collect();
+        assert_eq!(states, vec![false, true, false]);
+        assert_eq!(bands[1].0.left(), crate::px(30.));
+        assert_eq!(bands[1].0.right(), crate::px(90.));
+        assert_eq!(bands[0].0.right(), crate::px(30.));
+        assert_eq!(bands[2].0.left(), crate::px(90.));
+    }
+
+    #[test]
+    fn whole_rows_merge_into_one_band() {
+        let rows = [
+            band_row(0, 50., 200., false),
+            band_row(1, 0., 200., true),
+            band_row(2, 0., 200., true),
+            band_row(3, 0., 40., false),
+        ];
+        let bands = glyph_bands(5, &rows, element_bounds(), crate::px(0.), crate::px(20.));
+        let states: Vec<bool> = bands.iter().map(|(_, selected)| *selected).collect();
+        assert_eq!(
+            states,
+            vec![false, true, false, true, false, true, false, false]
+        );
+        assert_eq!(bands[3].0.top(), crate::px(20.));
+        assert_eq!(bands[3].0.bottom(), crate::px(60.));
+    }
 
     #[test]
     fn test_into_element_for() {
