@@ -312,6 +312,10 @@ pub struct Style {
     /// testing keep the untransformed bounds.
     pub transform: Option<ElementTransform>,
 
+    /// Whether triple-clicking text inside this element selects all of the element's text, like
+    /// a CSS block box around inline content.
+    pub selection_block: bool,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -875,6 +879,7 @@ impl Default for Style {
             mouse_cursor: None,
             opacity: None,
             transform: None,
+            selection_block: false,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

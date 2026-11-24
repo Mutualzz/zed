@@ -28,6 +28,7 @@ pub(crate) struct SelectableText {
     pub(crate) mask: Bounds<Pixels>,
     pub(crate) hitbox_floor: usize,
     pub(crate) selectable: bool,
+    pub(crate) block: Option<Bounds<Pixels>>,
 }
 
 impl SelectableText {
@@ -63,6 +64,7 @@ pub(crate) struct TextSelection {
     autoscroll_task: Option<Task<()>>,
     resolved: FxHashMap<TextKey, Range<usize>>,
     pieces: Vec<SelectedPiece>,
+    block_stack: Vec<Bounds<Pixels>>,
     pub(crate) color: Hsla,
 }
 
@@ -80,6 +82,7 @@ impl Default for TextSelection {
             autoscroll_task: None,
             resolved: FxHashMap::default(),
             pieces: Vec::new(),
+            block_stack: Vec::new(),
             color: Rgba {
                 r: 0.0,
                 g: 65.0 / 255.0,
@@ -171,6 +174,47 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+fn granularity_unit(
+    granularity: Granularity,
+    point: TextPoint,
+    texts: &[SelectableText],
+) -> Option<(TextPoint, TextPoint)> {
+    let text = texts.iter().find(|text| text.key == point.key)?;
+    let within = |range: Range<usize>| {
+        (
+            TextPoint {
+                key: point.key,
+                index: range.start,
+            },
+            TextPoint {
+                key: point.key,
+                index: range.end,
+            },
+        )
+    };
+    let content = text.layout.text();
+    Some(match (granularity, text.block) {
+        (Granularity::Character, _) => within(point.index..point.index),
+        (Granularity::Word, _) => within(word_range(&content, point.index)),
+        (Granularity::Block, None) => within(0..content.len()),
+        (Granularity::Block, Some(block)) => {
+            let in_block = |candidate: &&SelectableText| candidate.block == Some(block);
+            let first = texts.iter().find(in_block).unwrap_or(text);
+            let last = texts.iter().rev().find(in_block).unwrap_or(text);
+            (
+                TextPoint {
+                    key: first.key,
+                    index: 0,
+                },
+                TextPoint {
+                    key: last.key,
+                    index: last.layout.text().len(),
+                },
+            )
+        }
+    })
 }
 
 fn ordered(first: TextPoint, second: TextPoint, order: &FxHashMap<TextKey, usize>) -> bool {
@@ -311,22 +355,8 @@ impl TextSelection {
             .enumerate()
             .map(|(position, text)| (text.key, position))
             .collect();
-        let Some(text) = texts.iter().find(|text| text.key == point.key) else {
+        let Some((unit_start, unit_end)) = granularity_unit(self.granularity, point, texts) else {
             return;
-        };
-        let content = text.layout.text();
-        let unit = match self.granularity {
-            Granularity::Character => point.index..point.index,
-            Granularity::Word => word_range(&content, point.index),
-            Granularity::Block => 0..content.len(),
-        };
-        let unit_start = TextPoint {
-            key: point.key,
-            index: unit.start,
-        };
-        let unit_end = TextPoint {
-            key: point.key,
-            index: unit.end,
         };
         if ordered(unit_start, initial_start, &order) {
             self.anchor = Some(initial_end);
@@ -429,16 +459,11 @@ impl Window {
         let target = if suppressed {
             None
         } else {
-            self.text_under_mouse(event.position).map(|text| {
-                (
-                    text_point_for(text, event.position),
-                    text.layout.text(),
-                    text.mask,
-                )
-            })
+            self.text_under_mouse(event.position)
+                .map(|text| (text_point_for(text, event.position), text.mask))
         };
         if event.modifiers.shift
-            && let (Some((point, _, region)), Some(_anchor)) = (&target, self.text_selection.anchor)
+            && let (Some((point, region)), Some(_anchor)) = (&target, self.text_selection.anchor)
         {
             self.text_selection.head = Some(*point);
             self.text_selection.scroll_region = Some(*region);
@@ -451,24 +476,21 @@ impl Window {
             return;
         }
         let had_selection = self.text_selection.clear();
-        let Some((point, content, region)) = target else {
+        let Some((point, region)) = target else {
             if had_selection {
                 self.refresh();
             }
             return;
         };
-        let (granularity, range) = match event.click_count {
-            0 | 1 => (Granularity::Character, point.index..point.index),
-            2 => (Granularity::Word, word_range(&content, point.index)),
-            _ => (Granularity::Block, 0..content.len()),
+        let granularity = match event.click_count {
+            0 | 1 => Granularity::Character,
+            2 => Granularity::Word,
+            _ => Granularity::Block,
         };
-        let start = TextPoint {
-            key: point.key,
-            index: range.start,
-        };
-        let end = TextPoint {
-            key: point.key,
-            index: range.end,
+        let Some((start, end)) =
+            granularity_unit(granularity, point, &self.rendered_frame.selectable_texts)
+        else {
+            return;
         };
         self.text_selection.anchor = Some(start);
         self.text_selection.head = Some(end);
@@ -596,6 +618,7 @@ impl Window {
         layout: &TextLayout,
         hitbox_floor: usize,
         selectable: bool,
+        block: Option<Bounds<Pixels>>,
     ) -> Option<Range<usize>> {
         let path = self.element_id_stack.path_hash();
         let ordinal = self
@@ -615,12 +638,31 @@ impl Window {
             mask,
             hitbox_floor,
             selectable,
+            block,
         });
         if selectable {
             self.text_selection.range_for(key)
         } else {
             None
         }
+    }
+
+    pub(crate) fn with_selection_block<R>(
+        &mut self,
+        block: Option<Bounds<Pixels>>,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(block) = block else {
+            return paint(self);
+        };
+        self.text_selection.block_stack.push(block);
+        let result = paint(self);
+        self.text_selection.block_stack.pop();
+        result
+    }
+
+    pub(crate) fn current_selection_block(&self) -> Option<Bounds<Pixels>> {
+        self.text_selection.block_stack.last().copied()
     }
 
     pub(crate) fn resolve_text_selection(&mut self) {
@@ -681,8 +723,9 @@ impl Window {
 mod tests {
     use super::{autoscroll_delta, word_range};
     use crate::{
-        AppContext as _, Context, CursorStyle, InputEvent, IntoElement, MouseMoveEvent,
-        ParentElement, Render, Styled, TestAppContext, Window, bounds, div, point, px, size,
+        AppContext as _, Context, CursorStyle, InputEvent, IntoElement, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, Styled,
+        TestAppContext, Window, bounds, div, point, px, size,
     };
 
     struct Labels;
@@ -753,6 +796,83 @@ mod tests {
         assert!(!over_text_at(point(px(600.), px(10.)), cx));
         assert!(!over_text_at(point(px(2.), px(50.)), cx));
         assert!(!over_text_at(point(px(2.), px(70.)), cx));
+    }
+
+    struct WordRows;
+
+    impl Render for WordRows {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .h(px(20.))
+                        .flex()
+                        .selection_block()
+                        .child("Hello ")
+                        .child("big ")
+                        .child("world"),
+                )
+                .child(div().h(px(20.)).flex().child("Plain ").child("row"))
+        }
+    }
+
+    fn triple_click_selection(
+        position: crate::Point<crate::Pixels>,
+        cx: &mut TestAppContext,
+    ) -> Option<String> {
+        let window = cx.add_window(|_, _| WordRows);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.hovered.set(true);
+            window.active.set(true);
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 3,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 3,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.selected_text()
+        })
+        .expect("window updates")
+    }
+
+    #[crate::test]
+    fn triple_click_selects_every_text_in_a_selection_block(cx: &mut TestAppContext) {
+        assert_eq!(
+            triple_click_selection(point(px(2.), px(10.)), cx).as_deref(),
+            Some("Hello big world")
+        );
+    }
+
+    #[crate::test]
+    fn triple_click_outside_a_selection_block_selects_one_text(cx: &mut TestAppContext) {
+        assert_eq!(
+            triple_click_selection(point(px(2.), px(30.)), cx).as_deref(),
+            Some("Plain ")
+        );
     }
 
     #[test]

@@ -604,6 +604,7 @@ struct SelectionMetrics {
     hitbox_floor: usize,
     text_align: TextAlign,
     selectable: bool,
+    block: Option<Bounds<Pixels>>,
 }
 
 impl Default for SelectionMetrics {
@@ -612,6 +613,7 @@ impl Default for SelectionMetrics {
             hitbox_floor: 0,
             text_align: TextAlign::Left,
             selectable: true,
+            block: None,
         }
     }
 }
@@ -902,6 +904,7 @@ impl TextLayout {
             hitbox_floor: window.next_frame.hitboxes.len(),
             text_align: text_style.text_align,
             selectable: text_style.selectable,
+            block: window.current_selection_block(),
         };
     }
 
@@ -1028,7 +1031,12 @@ impl TextLayout {
         let text_style = window.text_style();
         let selection = if matches!(pass, TextPaintPass::All | TextPaintPass::Background) {
             let metrics = element_state.selection;
-            window.register_selectable_text(self, metrics.hitbox_floor, metrics.selectable)
+            window.register_selectable_text(
+                self,
+                metrics.hitbox_floor,
+                metrics.selectable,
+                metrics.block,
+            )
         } else {
             None
         };

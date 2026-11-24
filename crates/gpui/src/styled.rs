@@ -97,6 +97,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Makes triple-click select all the text inside this element, even when it is split into
+    /// several text elements (one per word in a wrapping row), like a CSS block box around inline
+    /// content. Text outside any selection block selects only its own element.
+    fn selection_block(mut self) -> Self {
+        self.style().selection_block = Some(true);
+        self
+    }
+
     /// Sets the truncate overflowing text with an ellipsis (…) at the end if needed.
     /// [Docs](https://tailwindcss.com/docs/text-overflow#ellipsis)
     fn text_ellipsis(mut self) -> Self {
