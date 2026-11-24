@@ -84,7 +84,8 @@ struct GlobalParams {
     depth_scale: f32,
     quad_count: u32,
     premultiplied_alpha: u32,
-    pad: u32,
+    // Set in frames with backdrop blurs, which skip the opaque pass.
+    quad_pass_draws_opaque: u32,
 }
 
 struct GammaParams {
@@ -599,7 +600,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let quad = load_quad(instance_id);
 
     var out = QuadVarying();
-    if (is_opaque_rectangle(quad)) {
+    if (globals.quad_pass_draws_opaque == 0u && is_opaque_rectangle(quad)) {
         out.position = CULLED_POSITION;
         return out;
     }

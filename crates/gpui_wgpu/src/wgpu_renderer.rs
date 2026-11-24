@@ -44,6 +44,9 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_subpixel.wgsl"),
 );
 
+/// Backdrop blur passes, a module of their own so WebGL2 can skip them.
+const BACKDROP_SHADERS: &str = include_str!("shaders_backdrop.wgsl");
+
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
     let mut second = right;
@@ -64,7 +67,7 @@ struct GlobalParams {
     depth_scale: f32,
     quad_count: u32,
     premultiplied_alpha: u32,
-    pad: u32,
+    quad_pass_draws_opaque: u32,
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -107,6 +110,61 @@ struct GammaParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct BackdropParams {
+    target_rect: [f32; 4],
+    source_rect: [f32; 4],
+    clamp_rect: [f32; 4],
+    bounds: [f32; 4],
+    content_mask: [f32; 4],
+    corner_radii: [f32; 4],
+    viewport_size: [f32; 2],
+    source_size: [f32; 2],
+    direction: [f32; 2],
+    sigma: f32,
+    saturation: f32,
+    opacity: f32,
+    block_size: f32,
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+
+struct BackdropPipelines {
+    downsample: wgpu::RenderPipeline,
+    blur: wgpu::RenderPipeline,
+    composite: wgpu::RenderPipeline,
+    blit: wgpu::RenderPipeline,
+}
+
+/// The textures a frame with backdrop blurs renders through. The frame is
+/// drawn offscreen so each blur can sample what was painted before it, then
+/// copied to the target.
+struct BackdropTargets {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    _textures: [wgpu::Texture; 3],
+    offscreen_view: wgpu::TextureView,
+    offscreen_bind_group: wgpu::BindGroup,
+    work_views: [wgpu::TextureView; 2],
+    work_bind_groups: [wgpu::BindGroup; 2],
+}
+
+struct BackdropParamsBuffer {
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    capacity: u64,
+}
+
+/// The params offsets of one frame's backdrop passes: four per drawn blur
+/// (downsample, horizontal, vertical, composite), indexed like
+/// `Scene::backdrop_blurs`, and one for the final copy.
+struct BackdropFramePlan {
+    blurs: Vec<Option<[u32; 4]>>,
+    blit_offset: u32,
+}
+
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -130,6 +188,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    backdrop: Option<BackdropPipelines>,
     premultiplied_alpha: bool,
 }
 
@@ -173,6 +232,7 @@ struct WgpuBindGroupLayouts {
     path_tiles: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    backdrop_params: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -222,12 +282,10 @@ struct WgpuRendererCore {
     transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
     depth_texture: Option<DepthTexture>,
-    /// Read by the headless renderer to create its render target.
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
-    ))]
     target_format: wgpu::TextureFormat,
+    uniform_alignment: u64,
+    backdrop_targets: Option<BackdropTargets>,
+    backdrop_params: Option<BackdropParamsBuffer>,
     max_texture_size: u32,
 }
 
@@ -673,12 +731,27 @@ impl WgpuRendererCore {
             ],
         });
 
+        let backdrop_params = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backdrop_params_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<BackdropParams>() as u64),
+                },
+                count: None,
+            }],
+        });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             path_tiles,
             texture,
             surfaces,
+            backdrop_params,
         }
     }
 
@@ -980,6 +1053,58 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        let backdrop = (!uses_webgl_instance_data).then(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gpui_backdrop_shaders"),
+                source: wgpu::ShaderSource::Wgsl(BACKDROP_SHADERS.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("backdrop_layout"),
+                bind_group_layouts: &[Some(&layouts.backdrop_params), Some(&layouts.texture)],
+                immediate_size: 0,
+            });
+            let create = |name: &str, fs_entry: &str, blend: Option<wgpu::BlendState>| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(name),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_backdrop"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some(fs_entry),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: surface_format,
+                            blend,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            BackdropPipelines {
+                downsample: create("backdrop_downsample", "fs_backdrop_downsample", None),
+                blur: create("backdrop_blur", "fs_backdrop_blur", None),
+                composite: create(
+                    "backdrop_composite",
+                    "fs_backdrop_composite",
+                    Some(blend_mode),
+                ),
+                blit: create("backdrop_blit", "fs_backdrop_blit", None),
+            }
+        });
+
         WgpuPipelines {
             quads,
             opaque_quads,
@@ -990,6 +1115,7 @@ impl WgpuRendererCore {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            backdrop,
             premultiplied_alpha,
         }
     }
@@ -1292,11 +1418,10 @@ impl WgpuRendererCore {
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
             depth_texture: None,
-            #[cfg(all(
-                not(target_family = "wasm"),
-                any(test, feature = "bench-support", feature = "test-support")
-            ))]
             target_format,
+            uniform_alignment,
+            backdrop_targets: None,
+            backdrop_params: None,
             max_texture_size,
         }
     }
@@ -1310,6 +1435,7 @@ impl WgpuRendererCore {
         surface_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) {
+        self.target_format = surface_format;
         self.resources.pipelines = Self::create_pipelines(
             &self.resources.device,
             &self.resources.bind_group_layouts,
@@ -1387,6 +1513,8 @@ impl WgpuRendererCore {
                 )
             })?;
         let depth_scale = quad_depth_scale(scene.quads.len());
+        let backdrop_frame =
+            self.resources().pipelines.backdrop.is_some() && !scene.backdrop_blurs.is_empty();
         let globals = GlobalParams {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
             path_paint_base: instance_bindings.path_tiles.paint_base,
@@ -1394,7 +1522,7 @@ impl WgpuRendererCore {
             depth_scale,
             quad_count: scene.quads.len() as u32,
             premultiplied_alpha: self.resources().pipelines.premultiplied_alpha as u32,
-            pad: 0,
+            quad_pass_draws_opaque: u32::from(backdrop_frame),
         };
         self.resources().queue.write_buffer(
             &self.resources().globals_buffer,
@@ -1403,11 +1531,26 @@ impl WgpuRendererCore {
         );
         self.prepare_texture_bind_groups(scene);
         self.ensure_depth_texture(size);
+        let backdrop_plan = if backdrop_frame {
+            Some(self.prepare_backdrop(scene, size)?)
+        } else {
+            None
+        };
         let depth_view = &self
             .depth_texture
             .as_ref()
             .context("depth texture missing")?
             .view;
+        let backdrop_targets = if backdrop_frame {
+            Some(
+                self.backdrop_targets
+                    .as_ref()
+                    .context("backdrop targets missing")?,
+            )
+        } else {
+            None
+        };
+        let render_view = backdrop_targets.map_or(frame_view, |targets| &targets.offscreen_view);
         // Quads are written first, so their instance indices are their
         // indices in `scene.quads` on both transports, which the quad depths
         // rely on.
@@ -1420,42 +1563,66 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
+        // The pass ends at every backdrop blur, which samples what it drew. Frames
+        // with blurs skip the opaque pass, so nothing writes depth and every pass
+        // can clear it.
+        let begin_main_pass = |encoder: &mut wgpu::CommandEncoder,
+                               load: wgpu::LoadOp<wgpu::Color>| {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("main_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
+                    ..Default::default()
+                })
+                .forget_lifetime();
             pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+            pass
+        };
 
-            self.draw_instances(
-                &instance_bindings.quads,
-                &self.resources().pipelines.opaque_quads,
-                instance_range(0..scene.quads.len()),
-                &mut pass,
-            );
+        {
+            let mut pass = begin_main_pass(&mut encoder, wgpu::LoadOp::Clear(clear_color));
+
+            if !backdrop_frame {
+                self.draw_instances(
+                    &instance_bindings.quads,
+                    &self.resources().pipelines.opaque_quads,
+                    instance_range(0..scene.quads.len()),
+                    &mut pass,
+                );
+            }
 
             let viewport_width = size.width.0 as f32;
             let viewport_height = size.height.0 as f32;
             let mut quad_cursor: u32 = 0;
             let mut path_tile_cursor = 0;
             for batch in scene.batches() {
+                if let PrimitiveBatch::BackdropBlurs(range) = &batch {
+                    if let (Some(targets), Some(plan)) = (backdrop_targets, backdrop_plan.as_ref())
+                    {
+                        drop(pass);
+                        for offsets in plan.blurs[range.clone()].iter().flatten() {
+                            self.encode_backdrop_blur(&mut encoder, targets, *offsets)?;
+                        }
+                        pass = begin_main_pass(&mut encoder, wgpu::LoadOp::Load);
+                    }
+                    continue;
+                }
                 // Quad shaders assign each quad its own depth.
                 // In every other batch type, the depth is fixed to the position of the quad cursor.
                 let (minimum_depth, maximum_depth) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
@@ -1543,10 +1710,31 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    // Backdrop blur is only implemented by the DirectX renderer.
                     PrimitiveBatch::BackdropBlurs(_blurs) => {}
                 }
             }
+        }
+
+        if let (Some(targets), Some(plan)) = (backdrop_targets, backdrop_plan.as_ref()) {
+            let pipelines = self
+                .resources()
+                .pipelines
+                .backdrop
+                .as_ref()
+                .context("backdrop pipelines missing")?;
+            let params = self
+                .backdrop_params
+                .as_ref()
+                .context("backdrop params missing")?;
+            Self::encode_backdrop_pass(
+                &mut encoder,
+                &pipelines.blit,
+                &params.bind_group,
+                &targets.offscreen_bind_group,
+                frame_view,
+                plan.blit_offset,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
         }
 
         let submission = self
@@ -1554,6 +1742,292 @@ impl WgpuRendererCore {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(submission)
+    }
+
+    fn ensure_backdrop_targets(&mut self, size: Size<DevicePixels>) {
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
+        let format = self.target_format;
+        if self.backdrop_targets.as_ref().is_some_and(|targets| {
+            targets.width == width && targets.height == height && targets.format == format
+        }) {
+            return;
+        }
+        let create = |label: &str| {
+            let texture = self
+                .resources()
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
+        let (offscreen, offscreen_view) = create("backdrop_offscreen");
+        let (first_work, first_work_view) = create("backdrop_work_0");
+        let (second_work, second_work_view) = create("backdrop_work_1");
+        let offscreen_bind_group =
+            self.create_texture_bind_group("backdrop_offscreen_bind_group", &offscreen_view);
+        let work_bind_groups = [
+            self.create_texture_bind_group("backdrop_work_0_bind_group", &first_work_view),
+            self.create_texture_bind_group("backdrop_work_1_bind_group", &second_work_view),
+        ];
+        self.backdrop_targets = Some(BackdropTargets {
+            width,
+            height,
+            format,
+            _textures: [offscreen, first_work, second_work],
+            offscreen_view,
+            offscreen_bind_group,
+            work_views: [first_work_view, second_work_view],
+            work_bind_groups,
+        });
+    }
+
+    fn ensure_backdrop_params(&mut self, required: u64) {
+        if self
+            .backdrop_params
+            .as_ref()
+            .is_some_and(|params| params.capacity >= required)
+        {
+            return;
+        }
+        let capacity = required.next_power_of_two().max(4096);
+        let resources = self.resources();
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("backdrop_params_buffer"),
+            size: capacity,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("backdrop_params_bind_group"),
+                layout: &resources.bind_group_layouts.backdrop_params,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(std::mem::size_of::<BackdropParams>() as u64),
+                    }),
+                }],
+            });
+        self.backdrop_params = Some(BackdropParamsBuffer {
+            buffer,
+            bind_group,
+            capacity,
+        });
+    }
+
+    /// Plans every backdrop blur of `scene` and uploads the params of its passes.
+    fn prepare_backdrop(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> Result<BackdropFramePlan> {
+        self.ensure_backdrop_targets(size);
+        let width = size.width.0 as f32;
+        let height = size.height.0 as f32;
+        let full_rect = [0.0, 0.0, width, height];
+        let base = BackdropParams {
+            viewport_size: [width, height],
+            source_size: [width, height],
+            premultiplied_alpha: u32::from(self.resources().pipelines.premultiplied_alpha),
+            ..BackdropParams::default()
+        };
+        let mut params = Vec::new();
+        let mut blurs = Vec::with_capacity(scene.backdrop_blurs.len());
+        for blur in &scene.backdrop_blurs {
+            let visible = blur.bounds.intersect(&blur.content_mask.bounds);
+            let plan = if visible.is_empty() {
+                None
+            } else {
+                BackdropPlan::new(visible, blur.radius.0, width, height)
+            };
+            let Some(plan) = plan else {
+                blurs.push(None);
+                continue;
+            };
+            let first = params.len() as u32;
+            params.push(BackdropParams {
+                target_rect: plan.small_rect,
+                source_rect: plan.region_rect,
+                clamp_rect: full_rect,
+                block_size: plan.factor,
+                ..base
+            });
+            for direction in [[1.0, 0.0], [0.0, 1.0]] {
+                params.push(BackdropParams {
+                    target_rect: plan.small_rect,
+                    source_rect: plan.small_rect,
+                    clamp_rect: plan.small_rect,
+                    direction,
+                    sigma: plan.small_sigma,
+                    ..base
+                });
+            }
+            let corner_radii = blur.corner_radii;
+            params.push(BackdropParams {
+                target_rect: plan.visible_rect,
+                source_rect: plan.visible_in_small,
+                clamp_rect: plan.small_rect,
+                bounds: [
+                    blur.bounds.origin.x.0,
+                    blur.bounds.origin.y.0,
+                    blur.bounds.size.width.0,
+                    blur.bounds.size.height.0,
+                ],
+                content_mask: [
+                    blur.content_mask.bounds.origin.x.0,
+                    blur.content_mask.bounds.origin.y.0,
+                    blur.content_mask.bounds.size.width.0,
+                    blur.content_mask.bounds.size.height.0,
+                ],
+                corner_radii: [
+                    corner_radii.top_left.0,
+                    corner_radii.top_right.0,
+                    corner_radii.bottom_right.0,
+                    corner_radii.bottom_left.0,
+                ],
+                saturation: blur.saturation,
+                opacity: blur.opacity,
+                ..base
+            });
+            blurs.push(Some([first, first + 1, first + 2, first + 3]));
+        }
+        let blit = params.len() as u32;
+        params.push(BackdropParams {
+            target_rect: full_rect,
+            source_rect: full_rect,
+            clamp_rect: full_rect,
+            ..base
+        });
+
+        let params_size = std::mem::size_of::<BackdropParams>();
+        let stride = (params_size as u64).next_multiple_of(self.uniform_alignment);
+        let required = stride * params.len() as u64;
+        self.ensure_backdrop_params(required);
+        let mut bytes = vec![0u8; required as usize];
+        for (index, entry) in params.iter().enumerate() {
+            let start = index * stride as usize;
+            bytes[start..start + params_size].copy_from_slice(bytemuck::bytes_of(entry));
+        }
+        let buffer = &self
+            .backdrop_params
+            .as_ref()
+            .context("backdrop params missing")?
+            .buffer;
+        self.resources().queue.write_buffer(buffer, 0, &bytes);
+
+        let offset = |slot: u32| (u64::from(slot) * stride) as u32;
+        Ok(BackdropFramePlan {
+            blurs: blurs
+                .into_iter()
+                .map(|slots| slots.map(|slots| slots.map(offset)))
+                .collect(),
+            blit_offset: offset(blit),
+        })
+    }
+
+    fn encode_backdrop_pass(
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        params_bind_group: &wgpu::BindGroup,
+        source_bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+        params_offset: u32,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("backdrop_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, params_bind_group, &[params_offset]);
+        pass.set_bind_group(1, source_bind_group, &[]);
+        pass.draw(0..4, 0..1);
+    }
+
+    /// Downsamples the backdrop behind one blur, blurs it horizontally then
+    /// vertically, and composites it back into the offscreen frame.
+    fn encode_backdrop_blur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &BackdropTargets,
+        offsets: [u32; 4],
+    ) -> Result<()> {
+        let pipelines = self
+            .resources()
+            .pipelines
+            .backdrop
+            .as_ref()
+            .context("backdrop pipelines missing")?;
+        let params = self
+            .backdrop_params
+            .as_ref()
+            .context("backdrop params missing")?;
+        let passes = [
+            (
+                &pipelines.downsample,
+                &targets.offscreen_bind_group,
+                &targets.work_views[0],
+                offsets[0],
+            ),
+            (
+                &pipelines.blur,
+                &targets.work_bind_groups[0],
+                &targets.work_views[1],
+                offsets[1],
+            ),
+            (
+                &pipelines.blur,
+                &targets.work_bind_groups[1],
+                &targets.work_views[0],
+                offsets[2],
+            ),
+            (
+                &pipelines.composite,
+                &targets.work_bind_groups[0],
+                &targets.offscreen_view,
+                offsets[3],
+            ),
+        ];
+        for (pipeline, source, target, offset) in passes {
+            Self::encode_backdrop_pass(
+                encoder,
+                pipeline,
+                &params.bind_group,
+                source,
+                target,
+                offset,
+                wgpu::LoadOp::Load,
+            );
+        }
+        Ok(())
     }
 
     fn ensure_depth_texture(&mut self, size: Size<DevicePixels>) {
@@ -2512,6 +2986,60 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     }
 }
 
+/// Where one backdrop blur reads and writes, in device pixels. The backdrop is
+/// downsampled by up to 8x before blurring, more the larger the blur radius is,
+/// then scaled back up when composited. Same plan as the DirectX renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BackdropPlan {
+    factor: f32,
+    small_sigma: f32,
+    region_rect: [f32; 4],
+    small_rect: [f32; 4],
+    visible_rect: [f32; 4],
+    visible_in_small: [f32; 4],
+}
+
+impl BackdropPlan {
+    fn new(visible: Bounds<ScaledPixels>, sigma: f32, width: f32, height: f32) -> Option<Self> {
+        if sigma <= 0.0 || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let reach = (sigma * 3.0).ceil();
+        let visible_left = visible.origin.x.0.max(0.0);
+        let visible_top = visible.origin.y.0.max(0.0);
+        let visible_right = (visible.origin.x.0 + visible.size.width.0).min(width);
+        let visible_bottom = (visible.origin.y.0 + visible.size.height.0).min(height);
+        if visible_right <= visible_left || visible_bottom <= visible_top {
+            return None;
+        }
+        let left = (visible_left - reach).max(0.0).floor();
+        let top = (visible_top - reach).max(0.0).floor();
+        let right = (visible_right + reach).min(width).ceil();
+        let bottom = (visible_bottom + reach).min(height).ceil();
+        let factor = (sigma / 3.0).floor().clamp(1.0, 8.0);
+        let small_width = ((right - left) / factor).ceil().max(1.0);
+        let small_height = ((bottom - top) / factor).ceil().max(1.0);
+        Some(Self {
+            factor,
+            small_sigma: sigma / factor,
+            region_rect: [left, top, small_width * factor, small_height * factor],
+            small_rect: [0.0, 0.0, small_width, small_height],
+            visible_rect: [
+                visible_left,
+                visible_top,
+                visible_right - visible_left,
+                visible_bottom - visible_top,
+            ],
+            visible_in_small: [
+                (visible_left - left) / factor,
+                (visible_top - top) / factor,
+                (visible_right - visible_left) / factor,
+                (visible_bottom - visible_top) / factor,
+            ],
+        })
+    }
+}
+
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
@@ -2742,6 +3270,11 @@ mod tests {
     }
 
     #[test]
+    fn backdrop_shader_is_valid_wgsl() {
+        validate_wgsl(BACKDROP_SHADERS, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
     fn subpixel_shader_is_valid_wgsl() {
         validate_wgsl(
             SUBPIXEL_SHADERS,
@@ -2885,5 +3418,194 @@ mod tests {
                 33.0_f32.to_bits(),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod backdrop_tests {
+    use super::BackdropPlan;
+    use gpui::{Bounds, ScaledPixels, point, size};
+
+    fn device_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    #[test]
+    fn small_blurs_stay_full_resolution() {
+        let plan = BackdropPlan::new(device_bounds(100., 100., 50., 20.), 2.0, 800., 600.).unwrap();
+        assert_eq!(plan.factor, 1.0);
+        assert_eq!(plan.small_sigma, 2.0);
+        assert_eq!(plan.region_rect, [94., 94., 62., 32.]);
+        assert_eq!(plan.visible_in_small, [6., 6., 50., 20.]);
+    }
+
+    #[test]
+    fn large_blurs_shrink_the_backdrop_and_clamp_to_the_frame() {
+        let plan = BackdropPlan::new(device_bounds(0., 0., 800., 600.), 12.0, 800., 600.).unwrap();
+        assert_eq!(plan.factor, 4.0);
+        assert_eq!(plan.small_sigma, 3.0);
+        assert_eq!(plan.small_rect, [0., 0., 200., 150.]);
+        assert_eq!(plan.region_rect, [0., 0., 800., 600.]);
+        assert_eq!(plan.visible_in_small, [0., 0., 200., 150.]);
+    }
+
+    #[test]
+    fn offscreen_or_zero_blurs_are_skipped() {
+        assert!(BackdropPlan::new(device_bounds(900., 0., 10., 10.), 4.0, 800., 600.).is_none());
+        assert!(BackdropPlan::new(device_bounds(0., 0., 10., 10.), 0.0, 800., 600.).is_none());
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod backdrop_render_tests {
+    use super::WgpuHeadlessRenderer;
+    use gpui::{
+        BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+        PlatformHeadlessRenderer, Point, Quad, ScaledPixels, Scene, Size,
+    };
+
+    fn device_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: Point {
+                x: ScaledPixels(x),
+                y: ScaledPixels(y),
+            },
+            size: Size {
+                width: ScaledPixels(width),
+                height: ScaledPixels(height),
+            },
+        }
+    }
+
+    fn solid_quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            order: 0,
+            border_style: BorderStyle::Solid,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: color.into(),
+            border_color: color,
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        }
+    }
+
+    fn blur(bounds: Bounds<ScaledPixels>, radius: f32, saturation: f32) -> BackdropBlur {
+        BackdropBlur {
+            order: 0,
+            radius: ScaledPixels(radius),
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            saturation,
+            opacity: 1.0,
+        }
+    }
+
+    fn red_blue_scene(backdrop: Option<BackdropBlur>) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(device_bounds(0., 0., 32., 32.), gpui::red()));
+        scene.insert_primitive(solid_quad(device_bounds(32., 0., 32., 32.), gpui::blue()));
+        if let Some(backdrop) = backdrop {
+            scene.insert_primitive(backdrop);
+        }
+        scene.finish();
+        scene
+    }
+
+    fn render(scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        renderer.render_scene_to_image(
+            scene,
+            Size {
+                width: DevicePixels(64),
+                height: DevicePixels(32),
+            },
+        )
+    }
+
+    #[test]
+    fn backdrop_blur_softens_edges_inside_its_bounds_only() -> anyhow::Result<()> {
+        let image = render(&red_blue_scene(Some(blur(
+            device_bounds(16., 0., 32., 32.),
+            4.0,
+            1.0,
+        ))))?;
+        let [left_red, _, left_blue, left_alpha] = image.get_pixel(31, 16).0;
+        let [right_red, _, right_blue, _] = image.get_pixel(32, 16).0;
+        assert!(
+            (40..=215).contains(&left_red) && (40..=215).contains(&left_blue),
+            "the edge should be mixed, was {:?}",
+            image.get_pixel(31, 16).0
+        );
+        assert!(
+            (40..=215).contains(&right_red) && (40..=215).contains(&right_blue),
+            "the edge should be mixed, was {:?}",
+            image.get_pixel(32, 16).0
+        );
+        assert_eq!(left_alpha, 255);
+        assert_eq!(image.get_pixel(8, 16).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(56, 16).0, [0, 0, 255, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn frames_without_blurs_render_unchanged() -> anyhow::Result<()> {
+        let image = render(&red_blue_scene(None))?;
+        assert_eq!(image.get_pixel(31, 16).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(32, 16).0, [0, 0, 255, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_corners_leave_the_corners_unblurred() -> anyhow::Result<()> {
+        let mut backdrop = blur(device_bounds(16., 0., 32., 32.), 4.0, 1.0);
+        backdrop.corner_radii = Corners::all(ScaledPixels(16.));
+        let image = render(&red_blue_scene(Some(backdrop)))?;
+        assert_eq!(image.get_pixel(16, 0).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(47, 31).0, [0, 0, 255, 255]);
+        let [red, _, blue, _] = image.get_pixel(32, 16).0;
+        assert!(
+            (40..=215).contains(&red) && (40..=215).contains(&blue),
+            "the middle should be mixed, was {:?}",
+            image.get_pixel(32, 16).0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_content_mask_clips_the_blur() -> anyhow::Result<()> {
+        let mut backdrop = blur(device_bounds(0., 0., 64., 32.), 4.0, 1.0);
+        backdrop.content_mask = ContentMask {
+            bounds: device_bounds(0., 0., 32., 32.),
+        };
+        let image = render(&red_blue_scene(Some(backdrop)))?;
+        assert_eq!(image.get_pixel(32, 16).0, [0, 0, 255, 255]);
+        let [red, _, blue, _] = image.get_pixel(31, 16).0;
+        assert!(
+            (40..=215).contains(&red) && (40..=215).contains(&blue),
+            "inside the mask the edge should be mixed, was {:?}",
+            image.get_pixel(31, 16).0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_saturation_turns_the_backdrop_gray() -> anyhow::Result<()> {
+        let image = render(&red_blue_scene(Some(blur(
+            device_bounds(0., 0., 16., 32.),
+            1.0,
+            0.0,
+        ))))?;
+        let [red, green, blue, _] = image.get_pixel(4, 16).0;
+        assert!(
+            red.abs_diff(green) <= 3 && green.abs_diff(blue) <= 3,
+            "zero saturation should be gray, was {:?}",
+            image.get_pixel(4, 16).0
+        );
+        Ok(())
     }
 }
