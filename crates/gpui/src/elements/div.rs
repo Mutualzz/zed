@@ -1460,6 +1460,17 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark this element as a live region (`aria-live`): assistive technology
+    /// announces its label whenever it changes, without moving focus.
+    ///
+    /// The element must also have a [`role`][Self::role] and an id so it
+    /// produces an accessibility node. On Windows, AccessKit raises UIA
+    /// `LiveRegionChanged` when the node's name changes.
+    fn aria_live(mut self, live: accesskit::Live) -> Self {
+        self.interactivity().aria.live = Some(live);
+        self
+    }
+
     /// Set the selected state for this element.
     fn aria_selected(mut self, selected: bool) -> Self {
         self.interactivity().aria.selected = Some(selected);
@@ -2245,6 +2256,7 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+    pub(crate) live: Option<accesskit::Live>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3747,6 +3759,9 @@ impl Interactivity {
         }
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
+        }
+        if let Some(live) = self.aria.live {
+            node.set_live(live);
         }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
@@ -5868,5 +5883,22 @@ mod tests {
         assert_eq!(bounds("cell-0").origin.x, px(0.));
         assert_eq!(bounds("cell-1").origin.x, px(100.));
         assert_eq!(bounds("cell-2").origin.x, px(300.));
+    }
+
+    #[test]
+    fn aria_live_is_written_to_the_accessibility_node() {
+        let mut status = div()
+            .id("status")
+            .role(accesskit::Role::Status)
+            .aria_label("Muted")
+            .aria_live(accesskit::Live::Polite);
+        let mut node = accesskit::Node::new(accesskit::Role::Status);
+        status.interactivity().write_a11y_info(&mut node);
+        assert_eq!(node.live(), Some(accesskit::Live::Polite));
+        assert_eq!(node.label(), Some("Muted"));
+
+        let mut plain = accesskit::Node::new(accesskit::Role::GenericContainer);
+        div().interactivity().write_a11y_info(&mut plain);
+        assert_eq!(plain.live(), None);
     }
 }
