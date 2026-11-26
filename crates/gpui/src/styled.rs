@@ -565,6 +565,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the shadows painted under the text, like CSS `text-shadow` (first entry on top).
+    ///
+    /// This value cascades to its child elements.
+    fn text_shadows(mut self, shadows: Vec<crate::TextShadow>) -> Self {
+        self.text_style().text_shadows = Some(shadows);
+        self
+    }
+
     /// Sets the extra space after every character, like CSS `letter-spacing`.
     ///
     /// This value cascades to its child elements.

@@ -1180,6 +1180,21 @@ impl TextLayout {
                 }
             }
             if matches!(pass, TextPaintPass::All | TextPaintPass::Foreground) {
+                for shadow in text_style.text_shadows.iter().rev() {
+                    let shadow_origin =
+                        line_origin + crate::point(shadow.offset_x, shadow.offset_y);
+                    window.with_glyph_shadow(*shadow, |window| {
+                        line.paint(
+                            shadow_origin,
+                            line_height,
+                            text_style.text_align,
+                            Some(bounds),
+                            window,
+                            cx,
+                        )
+                        .log_err();
+                    });
+                }
                 let bands = glyph_bands(
                     wrapped_rows(line).len(),
                     &rows,

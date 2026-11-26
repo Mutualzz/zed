@@ -1,5 +1,6 @@
 mod font_fallbacks;
 mod font_features;
+mod glyph_blur;
 mod line;
 mod line_layout;
 mod line_wrapper;
@@ -535,7 +536,14 @@ impl TextSystem {
             Ok(*bounds)
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
-            let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+            let bounds = if params.blur == 0 {
+                self.platform_text_system.glyph_raster_bounds(params)?
+            } else {
+                let unblurred = self
+                    .platform_text_system
+                    .glyph_raster_bounds(&params.without_blur())?;
+                glyph_blur::blurred_bounds(unblurred, params.blur)
+            };
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }
@@ -545,9 +553,18 @@ impl TextSystem {
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        let raster_bounds = self.raster_bounds(params)?;
-        self.platform_text_system
-            .rasterize_glyph(params, raster_bounds)
+        if params.blur == 0 {
+            let raster_bounds = self.raster_bounds(params)?;
+            return self
+                .platform_text_system
+                .rasterize_glyph(params, raster_bounds);
+        }
+        let unblurred = params.without_blur();
+        let raster_bounds = self.raster_bounds(&unblurred)?;
+        let (mask_size, mask) = self
+            .platform_text_system
+            .rasterize_glyph(&unblurred, raster_bounds)?;
+        Ok(glyph_blur::blur_alpha_mask(mask_size, &mask, params.blur))
     }
 
     /// Returns the dilation level to use for a glyph painted in the given color.
@@ -1099,6 +1116,19 @@ pub struct TextRun {
     pub strikethrough: Option<StrikethroughStyle>,
 }
 
+/// A shadow painted under text, like one entry of CSS `text-shadow`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TextShadow {
+    /// Horizontal offset in logical pixels.
+    pub offset_x: Pixels,
+    /// Vertical offset in logical pixels.
+    pub offset_y: Pixels,
+    /// CSS blur radius in logical pixels (the Gaussian's standard deviation is half of it).
+    pub blur: Pixels,
+    /// Shadow color.
+    pub color: Hsla,
+}
+
 /// Extra space added after every character, like CSS `letter-spacing`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
 pub enum LetterSpacing {
@@ -1201,6 +1231,17 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    /// CSS blur radius in device pixels; non-zero for blurred text shadows.
+    pub blur: u16,
+}
+
+impl RenderGlyphParams {
+    fn without_blur(&self) -> Self {
+        Self {
+            blur: 0,
+            ..self.clone()
+        }
+    }
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1215,6 +1256,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.blur.hash(state);
     }
 }
 

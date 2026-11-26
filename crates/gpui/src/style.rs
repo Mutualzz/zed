@@ -533,6 +533,9 @@ pub struct TextStyle {
     /// Extra space after every character, like CSS `letter-spacing`.
     pub letter_spacing: LetterSpacing,
 
+    /// Shadows painted under the glyphs, like CSS `text-shadow` (first entry on top).
+    pub text_shadows: Vec<crate::TextShadow>,
+
     /// Whether the text can be selected with the mouse, like CSS `user-select`.
     pub selectable: bool,
 }
@@ -557,6 +560,7 @@ impl Default for TextStyle {
             text_align: TextAlign::default(),
             line_clamp: None,
             letter_spacing: LetterSpacing::default(),
+            text_shadows: Vec::new(),
             selectable: true,
         }
     }

@@ -1285,6 +1285,7 @@ pub struct Window {
     focus_lost_path: SmallVec<[FocusId; 8]>,
     pub(crate) default_prevented: bool,
     pub(crate) text_selection: crate::text_selection::TextSelection,
+    glyph_shadow: Option<crate::TextShadow>,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -2460,6 +2461,7 @@ impl Window {
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             text_selection: crate::text_selection::TextSelection::default(),
+            glyph_shadow: None,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -3763,6 +3765,9 @@ impl Window {
         exclusions: &[Range<ScaledPixels>],
     ) {
         self.invalidator.debug_assert_paint();
+        if self.glyph_shadow.is_some() {
+            return;
+        }
         let underline = self.underline(origin, width, style);
         if exclusions.is_empty() {
             self.next_frame.scene.insert_primitive(underline);
@@ -5428,8 +5433,25 @@ impl Window {
         style: &UnderlineStyle,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.glyph_shadow.is_some() {
+            return;
+        }
         let underline = self.underline(origin, width, style);
         self.next_frame.scene.insert_primitive(underline);
+    }
+
+    /// Runs `f` with glyph painting switched to the given text shadow: glyphs are drawn as
+    /// blurred masks in the shadow color, emoji and text decorations are skipped. The caller
+    /// applies the shadow offset to the painted origin.
+    pub fn with_glyph_shadow<R>(
+        &mut self,
+        shadow: crate::TextShadow,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.glyph_shadow.replace(shadow);
+        let result = f(self);
+        self.glyph_shadow = previous;
+        result
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
@@ -5442,6 +5464,9 @@ impl Window {
         style: &StrikethroughStyle,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.glyph_shadow.is_some() {
+            return;
+        }
 
         let scale_factor = self.scale_factor();
         let height = style.thickness;
@@ -5495,8 +5520,23 @@ impl Window {
             (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
         );
         let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let shadow = self.glyph_shadow;
+        let (subpixel_rendering, dilation, blur, color) = match shadow {
+            Some(shadow) => (
+                false,
+                0,
+                (shadow.blur.0 * scale_factor)
+                    .round()
+                    .clamp(0.0, f32::from(u16::MAX)) as u16,
+                shadow.color,
+            ),
+            None => (
+                self.should_use_subpixel_rendering(font_id, font_size),
+                self.text_system().glyph_dilation_for_color(color),
+                0,
+                color,
+            ),
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -5506,6 +5546,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            blur,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -5585,6 +5626,9 @@ impl Window {
         font_size: Pixels,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        if self.glyph_shadow.is_some() {
+            return Ok(());
+        }
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
@@ -5598,6 +5642,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            blur: 0,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
