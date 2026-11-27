@@ -1249,6 +1249,11 @@ pub struct SpriteAnimationId(u32);
 impl SpriteAnimationId {
     /// No animation.
     pub const NONE: Self = Self(u32::MAX);
+
+    /// No animation, and the monochrome renderers use the mask coverage as-is instead of
+    /// applying the glyph contrast and gamma correction. Used for blurred glyph shadows,
+    /// whose soft tails the correction would strengthen (CSS shadows are linear coverage).
+    pub const NONE_LINEAR_COVERAGE: Self = Self(u32::MAX - 1);
 }
 
 impl Default for SpriteAnimationId {

@@ -5577,7 +5577,11 @@ impl Window {
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
-                    animation: SpriteAnimationId::NONE,
+                    animation: if shadow.is_some() {
+                        SpriteAnimationId::NONE_LINEAR_COVERAGE
+                    } else {
+                        SpriteAnimationId::NONE
+                    },
                     bounds,
                     content_mask,
                     color: color.opacity(element_opacity),

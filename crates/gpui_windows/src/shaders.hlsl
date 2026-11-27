@@ -1292,6 +1292,7 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float linear_coverage: LINEAR_COVERAGE;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1311,13 +1312,16 @@ MonochromeSpriteFragmentInput monochrome_sprite_vertex(uint vertex_id: SV_Vertex
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.linear_coverage = sprite.pad == 0xFFFFFFFEu ? 1.0 : 0.0;
     output.clip_distance = clip_distance;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
+    float alpha_corrected = input.linear_coverage > 0.5
+        ? sample
+        : apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
     return float4(input.color.rgb, input.color.a * alpha_corrected);
 }
 

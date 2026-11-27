@@ -1405,6 +1405,7 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) linear_coverage: f32,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1418,6 +1419,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
+    out.linear_coverage = select(0.0, 1.0, sprite.pad == 0xFFFFFFFEu);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
@@ -1425,7 +1427,8 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
-    let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    let corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    let alpha_corrected = select(corrected, sample, input.linear_coverage > 0.5);
 
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
