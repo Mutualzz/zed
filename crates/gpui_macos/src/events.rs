@@ -141,15 +141,18 @@ pub(crate) unsafe fn platform_input_from_native(
                             .modifierFlags()
                             .contains(NSEventModifierFlags::CapsLock),
                     },
+                    code: None,
                 }))
             }
             NSEventType::KeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: parse_keystroke(native_event),
                 is_held: native_event.isARepeat(),
                 prefer_character_input: false,
+                code: None,
             })),
             NSEventType::KeyUp => Some(PlatformInput::KeyUp(KeyUpEvent {
                 keystroke: parse_keystroke(native_event),
+                code: None,
             })),
             NSEventType::LeftMouseDown
             | NSEventType::RightMouseDown

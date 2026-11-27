@@ -2815,6 +2815,7 @@ mod tests {
                         keystroke: altgr_a.clone(),
                         is_held: false,
                         prefer_character_input: true,
+                        code: None,
                     }),
                     cx,
                 )
@@ -2837,6 +2838,7 @@ mod tests {
                         keystroke: altgr_a,
                         is_held: false,
                         prefer_character_input: false,
+                        code: None,
                     }),
                     cx,
                 )

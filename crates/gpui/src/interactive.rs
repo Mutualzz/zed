@@ -32,6 +32,10 @@ pub struct KeyDownEvent {
     /// Whether to prefer character input over keybindings for this keystroke.
     /// In some cases, like AltGr on Windows, modifiers are significant for character input.
     pub prefer_character_input: bool,
+
+    /// The physical key, named like the DOM `KeyboardEvent.code` (`"KeyA"`, `"Numpad0"`),
+    /// when the platform reports it.
+    pub code: Option<&'static str>,
 }
 
 impl Sealed for KeyDownEvent {}
@@ -47,6 +51,9 @@ impl KeyEvent for KeyDownEvent {}
 pub struct KeyUpEvent {
     /// The keystroke that was released.
     pub keystroke: Keystroke,
+
+    /// The physical key, named like the DOM `KeyboardEvent.code`, when the platform reports it.
+    pub code: Option<&'static str>,
 }
 
 impl Sealed for KeyUpEvent {}
@@ -64,6 +71,9 @@ pub struct ModifiersChangedEvent {
     pub modifiers: Modifiers,
     /// The new state of the capslock key
     pub capslock: Capslock,
+    /// The physical modifier key that changed, named like the DOM `KeyboardEvent.code`
+    /// (`"ShiftLeft"`, `"ControlRight"`), when the platform reports it.
+    pub code: Option<&'static str>,
 }
 
 impl Sealed for ModifiersChangedEvent {}

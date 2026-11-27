@@ -1009,6 +1009,7 @@ impl VisualTestContext {
         self.simulate_event(ModifiersChangedEvent {
             modifiers,
             capslock: Capslock { on: false },
+            code: None,
         })
     }
 
@@ -1017,6 +1018,7 @@ impl VisualTestContext {
         self.simulate_event(ModifiersChangedEvent {
             modifiers: Modifiers::none(),
             capslock: Capslock { on },
+            code: None,
         })
     }
 

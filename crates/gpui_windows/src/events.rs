@@ -409,8 +409,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_syskeyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
+        let input = handle_key_event(wparam, lparam, &self.state, |keystroke, _, code| {
+            PlatformInput::KeyUp(KeyUpEvent { keystroke, code })
         })?;
         let mut func = self.state.callbacks.input.take()?;
 
@@ -428,11 +428,12 @@ impl WindowsWindowInner {
             wparam,
             lparam,
             &self.state,
-            |keystroke, prefer_character_input| {
+            |keystroke, prefer_character_input, code| {
                 PlatformInput::KeyDown(KeyDownEvent {
                     keystroke,
                     is_held: lparam.0 & (0x1 << 30) > 0,
                     prefer_character_input,
+                    code,
                 })
             },
         ) else {
@@ -451,8 +452,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
-        let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
-            PlatformInput::KeyUp(KeyUpEvent { keystroke })
+        let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _, code| {
+            PlatformInput::KeyUp(KeyUpEvent { keystroke, code })
         }) else {
             return Some(1);
         };
@@ -826,6 +827,7 @@ impl WindowsWindowInner {
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: current_modifiers(),
                     capslock: current_capslock(),
+                    code: None,
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
@@ -1534,10 +1536,12 @@ fn handle_key_event<F>(
     f: F,
 ) -> Option<PlatformInput>
 where
-    F: FnOnce(Keystroke, bool) -> PlatformInput,
+    F: FnOnce(Keystroke, bool, Option<&'static str>) -> PlatformInput,
 {
     let virtual_key = VIRTUAL_KEY(wparam.loword());
     let modifiers = current_modifiers();
+    let key_flags = lparam.hiword();
+    let code = crate::keyboard::dom_code(key_flags & 0xFF, key_flags & KF_EXTENDED as u16 != 0);
 
     match virtual_key {
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN => {
@@ -1552,6 +1556,7 @@ where
             Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock: current_capslock(),
+                code,
             }))
         }
         VK_PACKET => None,
@@ -1568,11 +1573,12 @@ where
             Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                 modifiers,
                 capslock,
+                code,
             }))
         }
         vkey => {
             let keystroke = parse_normal_key(vkey, lparam, modifiers)?;
-            Some(f(keystroke.0, keystroke.1))
+            Some(f(keystroke.0, keystroke.1, code))
         }
     }
 }

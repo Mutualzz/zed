@@ -756,6 +756,7 @@ mod tests {
             let event = ModifiersChangedEvent {
                 modifiers: new_modifiers,
                 capslock: gpui::Capslock::default(),
+                code: None,
             };
 
             self.update_input(|input, window, cx| {
@@ -1190,8 +1191,12 @@ mod tests {
             keystroke: keystroke.clone(),
             is_held: false,
             prefer_character_input: false,
+            code: None,
         });
-        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke,
+            code: None,
+        });
         cx.simulate_modifiers_change(Modifiers::none());
     }
 
