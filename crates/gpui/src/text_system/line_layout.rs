@@ -635,13 +635,8 @@ impl LineLayoutCache {
         } else {
             drop(state);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(
-                &text,
-                font_size,
-                runs,
-                letter_spacing,
-                None,
-            );
+            let unwrapped_layout =
+                self.layout_line::<&SharedString>(&text, font_size, runs, letter_spacing, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(
                     text.as_ref(),

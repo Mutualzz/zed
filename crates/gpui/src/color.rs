@@ -809,7 +809,12 @@ impl std::fmt::Debug for Background {
             BackgroundTag::RadialGradient => write!(
                 f,
                 "RadialGradient(center {}, {}, radii {}, {}, {:?}, {:?})",
-                self.solid.h, self.solid.s, self.solid.l, self.solid.a, self.colors[0], self.colors[1]
+                self.solid.h,
+                self.solid.s,
+                self.solid.l,
+                self.solid.a,
+                self.colors[0],
+                self.colors[1]
             ),
         }
     }

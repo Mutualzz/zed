@@ -1195,6 +1195,8 @@ impl TextLayout {
                         .log_err();
                     });
                 }
+                let previous_grayscale =
+                    window.enable_grayscale_text(!text_style.text_shadows.is_empty());
                 let bands = glyph_bands(
                     wrapped_rows(line).len(),
                     &rows,
@@ -1230,6 +1232,7 @@ impl TextLayout {
                         });
                     }
                 }
+                window.restore_grayscale_text(previous_grayscale);
             }
             line_origin.y += line.size(line_height).height;
             line_start += line.len() + 1;

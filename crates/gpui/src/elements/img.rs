@@ -1,10 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Global, ImageId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource, SharedString,
-    SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image, decode_static_image,
-    decode_webp_image, px,
+    Entity, Global, GlobalElementId, Hitbox, Image, ImageCache, ImageId, InspectorElementId,
+    InteractiveElement, Interactivity, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
+    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_gif_image,
+    decode_static_image, decode_webp_image, px,
 };
 use anyhow::Result;
 
@@ -179,7 +178,11 @@ fn blurred_image(
         window.drop_image(image).log_err();
     }
     let cache = cx.default_global::<BlurredImages>();
-    if let Some((_key, image)) = cache.ready.iter().find(|(ready_key, _image)| *ready_key == key) {
+    if let Some((_key, image)) = cache
+        .ready
+        .iter()
+        .find(|(ready_key, _image)| *ready_key == key)
+    {
         return image.clone();
     }
     if cache.pending.contains(&key) {
@@ -603,16 +606,15 @@ impl Element for Img {
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
-                    let data = if self.style.blur > Pixels::ZERO
-                        && new_bounds.size.width > Pixels::ZERO
-                    {
-                        let image_width = data.size(layout_state.frame_index).width.0 as f32;
-                        let sigma = f32::from(self.style.blur) * image_width
-                            / f32::from(new_bounds.size.width);
-                        blurred_image(&data, sigma, window, cx)
-                    } else {
-                        data
-                    };
+                    let data =
+                        if self.style.blur > Pixels::ZERO && new_bounds.size.width > Pixels::ZERO {
+                            let image_width = data.size(layout_state.frame_index).width.0 as f32;
+                            let sigma = f32::from(self.style.blur) * image_width
+                                / f32::from(new_bounds.size.width);
+                            blurred_image(&data, sigma, window, cx)
+                        } else {
+                            data
+                        };
                     window
                         .paint_image_with_filter(
                             bounds,
@@ -1026,23 +1028,27 @@ mod tests {
             .expect("render images have a state id");
         let observed = std::rc::Rc::new(std::cell::Cell::new(None));
         let observed_frame = observed.clone();
-        window.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), move |_, _| {
-            div()
-                .child(img(ImageSource::Render(image)))
-                .child(canvas(
-                    |_, _, _| (),
-                    move |_, _, window, _| {
-                        window.with_global_id(state_id, |id, window| {
-                            window.with_element_state::<ImgState, _>(id, |state, _| {
-                                let state = state.expect("id-less img stores frame state");
-                                observed_frame.set(Some(state.frame_index));
-                                ((), state)
+        window.draw(
+            point(px(0.), px(0.)),
+            size(px(100.), px(100.)),
+            move |_, _| {
+                div()
+                    .child(img(ImageSource::Render(image)))
+                    .child(canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            window.with_global_id(state_id, |id, window| {
+                                window.with_element_state::<ImgState, _>(id, |state, _| {
+                                    let state = state.expect("id-less img stores frame state");
+                                    observed_frame.set(Some(state.frame_index));
+                                    ((), state)
+                                });
                             });
-                        });
-                    },
-                ))
-                .into_any_element()
-        });
+                        },
+                    ))
+                    .into_any_element()
+            },
+        );
         assert_eq!(observed.get(), Some(0));
     }
 

@@ -1286,6 +1286,7 @@ pub struct Window {
     pub(crate) default_prevented: bool,
     pub(crate) text_selection: crate::text_selection::TextSelection,
     glyph_shadow: Option<crate::TextShadow>,
+    grayscale_text: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -2462,6 +2463,7 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             text_selection: crate::text_selection::TextSelection::default(),
             glyph_shadow: None,
+            grayscale_text: false,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -5454,6 +5456,19 @@ impl Window {
         result
     }
 
+    /// Turns off subpixel (ClearType) anti-aliasing for the glyphs painted next when
+    /// `grayscale` is true, like browsers do for text under a `filter` such as
+    /// `drop-shadow`. Returns the previous setting for [`Self::restore_grayscale_text`].
+    pub(crate) fn enable_grayscale_text(&mut self, grayscale: bool) -> bool {
+        let previous = self.grayscale_text;
+        self.grayscale_text = previous || grayscale;
+        previous
+    }
+
+    pub(crate) fn restore_grayscale_text(&mut self, previous: bool) {
+        self.grayscale_text = previous;
+    }
+
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5531,7 +5546,7 @@ impl Window {
                 shadow.color,
             ),
             None => (
-                self.should_use_subpixel_rendering(font_id, font_size),
+                !self.grayscale_text && self.should_use_subpixel_rendering(font_id, font_size),
                 self.text_system().glyph_dilation_for_color(color),
                 0,
                 color,
