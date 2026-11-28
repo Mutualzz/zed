@@ -297,6 +297,13 @@ pub struct Style {
     /// Saturation applied to the blurred backdrop, like CSS `backdrop-filter: saturate()`.
     pub backdrop_saturation: Option<f32>,
 
+    /// Blur radius of the element and everything in it, like CSS `filter: blur()`.
+    pub filter_blur: Option<Pixels>,
+
+    /// Tilt of the element and everything in it, like CSS
+    /// `transform: perspective(..) rotateX(..)` with the default centre origin.
+    pub perspective_tilt: Option<PerspectiveTilt>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -357,6 +364,15 @@ pub enum Visibility {
     Visible,
     /// The element should not be drawn, but should still take up space in the layout.
     Hidden,
+}
+
+/// A tilt around the horizontal centre line, like CSS `transform: perspective(..) rotateX(..)`
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PerspectiveTilt {
+    /// The rotation in degrees. Positive values tip the top away from the viewer.
+    pub degrees: f32,
+    /// The distance from the viewer to the untilted element.
+    pub perspective: Pixels,
 }
 
 /// A scale and translation applied when painting, like CSS `transform: translate(..) scale(..)`
@@ -754,6 +770,35 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
+        if self.filter_blur.is_none() && self.perspective_tilt.is_none() {
+            return self.paint_unfiltered(bounds, window, cx, continuation);
+        }
+        let painted_bounds = bounds.dilate(self.drop_shadow_reach());
+        let radius = self.filter_blur.unwrap_or(Pixels::ZERO);
+        window.with_element_filter(painted_bounds, radius, self.perspective_tilt, |window| {
+            self.paint_unfiltered(bounds, window, cx, continuation)
+        })
+    }
+
+    fn drop_shadow_reach(&self) -> Pixels {
+        self.box_shadow
+            .iter()
+            .filter(|shadow| !shadow.inset)
+            .fold(Pixels::ZERO, |reach, shadow| {
+                let extent = shadow.blur_radius * 3.0
+                    + shadow.spread_radius.max(Pixels::ZERO)
+                    + shadow.offset.x.abs().max(shadow.offset.y.abs());
+                if extent > reach { extent } else { reach }
+            })
+    }
+
+    fn paint_unfiltered(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.set_global(DebugBelow)
@@ -879,6 +924,8 @@ impl Default for Style {
             box_shadow: Default::default(),
             backdrop_blur: None,
             backdrop_saturation: None,
+            filter_blur: None,
+            perspective_tilt: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

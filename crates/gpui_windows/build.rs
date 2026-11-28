@@ -43,6 +43,7 @@ mod shader_compilation {
             "backdrop_downsample",
             "backdrop_blur",
             "backdrop_composite",
+            "filter_composite",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

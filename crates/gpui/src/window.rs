@@ -1287,6 +1287,7 @@ pub struct Window {
     pub(crate) text_selection: crate::text_selection::TextSelection,
     glyph_shadow: Option<crate::TextShadow>,
     grayscale_text: bool,
+    filter_active: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -2464,6 +2465,7 @@ impl Window {
             text_selection: crate::text_selection::TextSelection::default(),
             glyph_shadow: None,
             grayscale_text: false,
+            filter_active: false,
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
             dirty_views: FxHashSet::default(),
@@ -5467,6 +5469,51 @@ impl Window {
 
     pub(crate) fn restore_grayscale_text(&mut self, previous: bool) {
         self.grayscale_text = previous;
+    }
+
+    /// Paints everything `paint` paints as one image, blurred by `radius` (the Gaussian standard
+    /// deviation) like CSS `filter: blur(radius)` and tilted around the horizontal centre line
+    /// of `bounds` like CSS `transform: perspective(..) rotateX(..)`. `bounds` must cover
+    /// everything `paint` paints. Text inside is drawn with grayscale antialiasing, as Chromium
+    /// does under a filter or a 3D transform. A filter inside another filter is ignored.
+    pub fn with_element_filter<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        radius: Pixels,
+        tilt: Option<crate::PerspectiveTilt>,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let tilt = tilt.filter(|tilt| tilt.degrees != 0.0 && tilt.perspective > Pixels::ZERO);
+        if (radius <= Pixels::ZERO && tilt.is_none()) || self.filter_active {
+            return paint(self);
+        }
+        let scale_factor = self.scale_factor();
+        let radius = radius.max(Pixels::ZERO).scale(scale_factor);
+        let reach = ScaledPixels((radius.0 * 3.0).ceil());
+        let filter = crate::ElementFilter {
+            order: 0,
+            radius,
+            rotate_x: tilt.map_or(0.0, |tilt| tilt.degrees.to_radians()),
+            perspective: tilt.map_or(ScaledPixels(0.0), |tilt| {
+                tilt.perspective.scale(scale_factor)
+            }),
+            origin: bounds.center().scale(scale_factor),
+            bounds: self.snap_bounds(bounds).dilate(reach),
+            content_mask: self.snapped_content_mask(),
+        };
+        self.next_frame
+            .scene
+            .insert_primitive(crate::Primitive::FilterStart(filter));
+        self.filter_active = true;
+        let previous_grayscale = self.enable_grayscale_text(true);
+        let result = paint(self);
+        self.restore_grayscale_text(previous_grayscale);
+        self.filter_active = false;
+        self.next_frame
+            .scene
+            .insert_primitive(crate::Primitive::FilterEnd(filter));
+        result
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.

@@ -757,6 +757,7 @@ mod tests {
                 modifiers: new_modifiers,
                 capslock: gpui::Capslock::default(),
                 code: None,
+                key_pressed: None,
             };
 
             self.update_input(|input, window, cx| {

@@ -61,6 +61,8 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub backdrop_blurs: Vec<BackdropBlur>,
+    pub filter_starts: Vec<ElementFilter>,
+    pub filter_ends: Vec<ElementFilter>,
     animations: Vec<SpriteAnimation>,
     transform_stack: Vec<(PaintTransform, ContentMask<ScaledPixels>)>,
 }
@@ -82,6 +84,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
+        self.filter_starts.clear();
+        self.filter_ends.clear();
         self.animations.clear();
     }
 
@@ -140,8 +144,8 @@ impl Scene {
         self.layers.push_back(Layer {
             primitives: SmallVec::new(),
             bounds: Bounds::default(),
-            max_kind: PrimitiveKind::Shadow,
-            max_shared_kind: PrimitiveKind::BackdropBlur,
+            max_kind: PrimitiveKind::FilterStart,
+            max_shared_kind: PrimitiveKind::FilterEnd,
         });
         self.paint_operations.push(PaintOperation::StartLayer);
     }
@@ -262,6 +266,12 @@ impl Scene {
             Primitive::BackdropBlur(blur) => {
                 self.backdrop_blurs.push(BackdropBlur { order, ..blur })
             }
+            Primitive::FilterStart(filter) => {
+                self.filter_starts.push(ElementFilter { order, ..filter })
+            }
+            Primitive::FilterEnd(filter) => {
+                self.filter_ends.push(ElementFilter { order, ..filter })
+            }
         }
     }
 
@@ -303,6 +313,8 @@ impl Scene {
         });
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.filter_starts.sort_by_key(|blur| blur.order);
+        self.filter_ends.sort_by_key(|blur| blur.order);
 
         // Sorting moved the sprites, so animations learn where theirs ended up.
         if !self.animations.is_empty() {
@@ -341,6 +353,10 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             backdrop_blurs_start: 0,
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
+            filter_starts_start: 0,
+            filter_starts_iter: self.filter_starts.iter().peekable(),
+            filter_ends_start: 0,
+            filter_ends_iter: self.filter_ends.iter().peekable(),
         }
     }
 }
@@ -405,6 +421,7 @@ pub fn quad_depth(quad_id: u32, scale: f32) -> f32 {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    FilterStart,
     Shadow,
     #[default]
     Quad,
@@ -415,6 +432,7 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     BackdropBlur,
+    FilterEnd,
 }
 
 impl PrimitiveKind {
@@ -430,6 +448,7 @@ impl PrimitiveKind {
             Self::SubpixelSprite => Self::MonochromeSprite,
             Self::PolychromeSprite => Self::SubpixelSprite,
             Self::BackdropBlur => Self::Shadow,
+            Self::FilterEnd => Self::FilterStart,
             kind => kind,
         }
     }
@@ -453,6 +472,8 @@ pub enum Primitive {
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
     BackdropBlur(BackdropBlur),
+    FilterStart(ElementFilter),
+    FilterEnd(ElementFilter),
 }
 
 #[expect(missing_docs)]
@@ -468,6 +489,8 @@ impl Primitive {
             Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
             Primitive::Surface(_) => PrimitiveKind::Surface,
             Primitive::BackdropBlur(_) => PrimitiveKind::BackdropBlur,
+            Primitive::FilterStart(_) => PrimitiveKind::FilterStart,
+            Primitive::FilterEnd(_) => PrimitiveKind::FilterEnd,
         }
     }
 
@@ -482,6 +505,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::BackdropBlur(blur) => &blur.bounds,
+            Primitive::FilterStart(filter) | Primitive::FilterEnd(filter) => &filter.bounds,
         }
     }
 
@@ -542,6 +566,13 @@ impl Primitive {
                 blur.radius = transform.length(blur.radius);
                 blur.content_mask = transform.content_mask(&blur.content_mask, outer_mask);
             }
+            Primitive::FilterStart(filter) | Primitive::FilterEnd(filter) => {
+                filter.bounds = transform.bounds(filter.bounds);
+                filter.radius = transform.length(filter.radius);
+                filter.perspective = transform.length(filter.perspective);
+                filter.origin = transform.point(filter.origin);
+                filter.content_mask = transform.content_mask(&filter.content_mask, outer_mask);
+            }
         }
     }
 
@@ -579,6 +610,7 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::BackdropBlur(blur) => &blur.content_mask,
+            Primitive::FilterStart(filter) | Primitive::FilterEnd(filter) => &filter.content_mask,
         }
     }
 }
@@ -609,6 +641,10 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     backdrop_blurs_start: usize,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
+    filter_starts_start: usize,
+    filter_starts_iter: Peekable<slice::Iter<'a, ElementFilter>>,
+    filter_ends_start: usize,
+    filter_ends_iter: Peekable<slice::Iter<'a, ElementFilter>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -648,6 +684,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.backdrop_blurs_iter.peek().map(|blur| blur.order),
                 PrimitiveKind::BackdropBlur,
+            ),
+            (
+                self.filter_starts_iter.peek().map(|blur| blur.order),
+                PrimitiveKind::FilterStart,
+            ),
+            (
+                self.filter_ends_iter.peek().map(|blur| blur.order),
+                PrimitiveKind::FilterEnd,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -808,6 +852,18 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.backdrop_blurs_start = blurs_end;
                 Some(PrimitiveBatch::BackdropBlurs(blurs_start..blurs_end))
             }
+            PrimitiveKind::FilterStart => {
+                let index = self.filter_starts_start;
+                self.filter_starts_iter.next();
+                self.filter_starts_start = index + 1;
+                Some(PrimitiveBatch::FilterStart(index))
+            }
+            PrimitiveKind::FilterEnd => {
+                let index = self.filter_ends_start;
+                self.filter_ends_iter.next();
+                self.filter_ends_start = index + 1;
+                Some(PrimitiveBatch::FilterEnd(index))
+            }
         }
     }
 }
@@ -841,6 +897,8 @@ pub enum PrimitiveBatch {
     },
     Surfaces(Range<usize>),
     BackdropBlurs(Range<usize>),
+    FilterStart(usize),
+    FilterEnd(usize),
 }
 
 impl PrimitiveBatch {
@@ -874,6 +932,8 @@ impl PrimitiveBatch {
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
             Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
+            Self::FilterStart(index) => format!("filter start ({index})"),
+            Self::FilterEnd(index) => format!("filter end ({index})"),
         }
     }
 }
@@ -929,6 +989,31 @@ impl From<BackdropBlur> for Primitive {
     fn from(blur: BackdropBlur) -> Self {
         Primitive::BackdropBlur(blur)
     }
+}
+
+/// Paints everything between a [`Primitive::FilterStart`] and the matching
+/// [`Primitive::FilterEnd`] as one image, blurred like CSS `filter: blur()` and tilted like
+/// CSS `transform: perspective() rotateX()`.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct ElementFilter {
+    /// The draw order.
+    pub order: DrawOrder,
+    /// The Gaussian standard deviation in device pixels (the CSS blur radius), zero for none.
+    pub radius: ScaledPixels,
+    /// The tilt around the horizontal line through `origin` in radians, zero for none. Positive
+    /// values tip the top away from the viewer, like CSS `rotateX()`.
+    pub rotate_x: f32,
+    /// The distance from the viewer to the untilted plane in device pixels, like CSS
+    /// `perspective()`.
+    pub perspective: ScaledPixels,
+    /// The point the tilt turns around.
+    pub origin: Point<ScaledPixels>,
+    /// The area the group is painted into before it is blurred and tilted, already grown by
+    /// the blur's reach.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip applied to the filtered group.
+    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1490,6 +1575,58 @@ mod tests {
             saturation: 1.0,
             opacity: 1.0,
         }
+    }
+
+    fn filter_blur(left: f32) -> ElementFilter {
+        ElementFilter {
+            order: 0,
+            radius: ScaledPixels(2.),
+            rotate_x: 0.,
+            perspective: ScaledPixels(0.),
+            origin: point(ScaledPixels(left + 5.), ScaledPixels(5.)),
+            bounds: square(left).dilate(ScaledPixels(6.)),
+            content_mask: window_mask(),
+        }
+    }
+
+    #[test]
+    fn filter_blur_wraps_only_what_was_painted_inside_it() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(Primitive::FilterStart(filter_blur(0.)));
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(Primitive::FilterEnd(filter_blur(0.)));
+        scene.insert_primitive(quad(0.));
+        assert_eq!(
+            batch_labels(&mut scene),
+            [
+                "quads (1)",
+                "filter start (0)",
+                "quads (1)",
+                "filter end (0)",
+                "quads (1)",
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_blur_inside_a_layer_starts_first_and_ends_last() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0.));
+        scene.push_layer();
+        scene.insert_primitive(Primitive::FilterStart(filter_blur(0.)));
+        scene.insert_primitive(quad(0.));
+        scene.insert_primitive(Primitive::FilterEnd(filter_blur(0.)));
+        scene.pop_layer();
+        assert_eq!(
+            batch_labels(&mut scene),
+            [
+                "quads (1)",
+                "filter start (0)",
+                "quads (1)",
+                "filter end (0)",
+            ]
+        );
     }
 
     fn window_mask() -> ContentMask<ScaledPixels> {

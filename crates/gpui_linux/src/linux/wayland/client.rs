@@ -2109,6 +2109,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     modifiers: state.modifiers,
                     capslock: state.capslock,
                     code: None,
+                    key_pressed: None,
                 });
                 drop(state);
 

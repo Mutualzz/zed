@@ -553,6 +553,24 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blurs this element and everything in it as one image, like CSS `filter: blur(radius)`.
+    /// The Metal renderer paints the element unblurred.
+    fn filter_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().filter_blur = Some(radius.into());
+        self
+    }
+
+    /// Tilts this element and everything in it around its horizontal centre line when
+    /// painting, like CSS `transform: perspective(perspective) rotateX(degrees)`. Layout and
+    /// hit testing are unchanged. The Metal renderer paints it flat.
+    fn perspective_tilt(mut self, degrees: f32, perspective: impl Into<crate::Pixels>) -> Self {
+        self.style().perspective_tilt = Some(crate::PerspectiveTilt {
+            degrees,
+            perspective: perspective.into(),
+        });
+        self
+    }
+
     /// Blurs the backdrop behind this element, like CSS `backdrop-filter: blur(radius)`.
     fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
         self.style().backdrop_blur = Some(radius.into());

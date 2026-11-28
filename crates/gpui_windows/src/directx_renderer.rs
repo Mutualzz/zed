@@ -102,6 +102,8 @@ struct BackdropPipeline {
     blur_fragment: ID3D11PixelShader,
     composite_vertex: ID3D11VertexShader,
     composite_fragment: ID3D11PixelShader,
+    filter_composite_vertex: ID3D11VertexShader,
+    filter_composite_fragment: ID3D11PixelShader,
     opaque_blend_state: ID3D11BlendState,
     composite_blend_state: ID3D11BlendState,
     depth_stencil_state: ID3D11DepthStencilState,
@@ -119,7 +121,32 @@ struct BackdropResources {
     width: u32,
     height: u32,
     frame_copy: BackdropTexture,
+    filter_saved: BackdropTexture,
     work: [BackdropTexture; 2],
+}
+
+fn filter_area(filter: &ElementFilter, width: u32, height: u32) -> Option<[u32; 4]> {
+    let visible = filter.bounds.intersect(&filter.content_mask.bounds);
+    let left = visible.origin.x.0.floor().clamp(0.0, width as f32) as u32;
+    let top = visible.origin.y.0.floor().clamp(0.0, height as f32) as u32;
+    let right = (visible.origin.x.0 + visible.size.width.0)
+        .ceil()
+        .clamp(0.0, width as f32) as u32;
+    let bottom = (visible.origin.y.0 + visible.size.height.0)
+        .ceil()
+        .clamp(0.0, height as f32) as u32;
+    (right > left && bottom > top).then_some([left, top, right, bottom])
+}
+
+fn area_box([left, top, right, bottom]: [u32; 4]) -> D3D11_BOX {
+    D3D11_BOX {
+        left,
+        top,
+        front: 0,
+        right,
+        bottom,
+        back: 1,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -137,6 +164,7 @@ struct BackdropParams {
     saturation: f32,
     opacity: f32,
     block_size: f32,
+    tilt: [f32; 4],
 }
 
 struct DirectXGlobalElements {
@@ -427,7 +455,8 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         let depth_scale = quad_depth_scale(scene.quads.len());
-        let has_backdrop_blurs = !scene.backdrop_blurs.is_empty();
+        let has_backdrop_blurs =
+            !scene.backdrop_blurs.is_empty() || !scene.filter_starts.is_empty();
         self.pre_draw(
             &match background_appearance {
                 WindowBackgroundAppearance::Opaque => [1.0f32; 4],
@@ -500,6 +529,12 @@ impl DirectXRenderer {
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 PrimitiveBatch::BackdropBlurs(range) => {
                     self.draw_backdrop_blurs(&scene.backdrop_blurs[range])
+                }
+                PrimitiveBatch::FilterStart(index) => {
+                    self.start_filter(&scene.filter_starts[index])
+                }
+                PrimitiveBatch::FilterEnd(index) => {
+                    self.end_filter(&scene.filter_ends[index])
                 }
             }
             .with_context(|| {
@@ -972,6 +1007,7 @@ impl DirectXRenderer {
             width: desc.Width,
             height: desc.Height,
             frame_copy: create(sampled, false)?,
+            filter_saved: create(sampled, false)?,
             work: [create(rendered, true)?, create(rendered, true)?],
         });
         Ok(())
@@ -1025,7 +1061,10 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.ensure_backdrop_resources()?;
-        let backdrop = self.backdrop.as_ref().context("backdrop resources missing")?;
+        let backdrop = self
+            .backdrop
+            .as_ref()
+            .context("backdrop resources missing")?;
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         let render_target = resources
@@ -1122,6 +1161,175 @@ impl DirectXRenderer {
             )?;
         }
         Ok(())
+    }
+
+    fn start_filter(&mut self, filter: &ElementFilter) -> Result<()> {
+        self.ensure_backdrop_resources()?;
+        let backdrop = self
+            .backdrop
+            .as_ref()
+            .context("backdrop resources missing")?;
+        let Some(area) = filter_area(filter, backdrop.width, backdrop.height) else {
+            return Ok(());
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("render target missing")?;
+        let cleared = backdrop.work[1]
+            .render_target_view
+            .as_ref()
+            .context("backdrop work view missing")?;
+        let area_box = area_box(area);
+        unsafe {
+            let context = &devices.device_context;
+            context.CopyResource(&backdrop.filter_saved.texture, render_target);
+            context.ClearRenderTargetView(cleared, &[0.0; 4]);
+            context.CopySubresourceRegion(
+                render_target,
+                0,
+                area[0],
+                area[1],
+                0,
+                &backdrop.work[1].texture,
+                0,
+                Some(&area_box),
+            );
+        }
+        Ok(())
+    }
+
+    fn end_filter(&mut self, filter: &ElementFilter) -> Result<()> {
+        self.ensure_backdrop_resources()?;
+        let backdrop = self
+            .backdrop
+            .as_ref()
+            .context("backdrop resources missing")?;
+        let width = backdrop.width as f32;
+        let height = backdrop.height as f32;
+        let Some(area) = filter_area(filter, backdrop.width, backdrop.height) else {
+            return Ok(());
+        };
+        let area_rect = [
+            area[0] as f32,
+            area[1] as f32,
+            (area[2] - area[0]) as f32,
+            (area[3] - area[1]) as f32,
+        ];
+        let visible = Bounds {
+            origin: point(ScaledPixels(area_rect[0]), ScaledPixels(area_rect[1])),
+            size: size(ScaledPixels(area_rect[2]), ScaledPixels(area_rect[3])),
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("render target missing")?;
+        let pipeline = &self.pipelines.backdrop;
+        let source_size = [width, height];
+        let restore_area = || unsafe {
+            devices.device_context.CopySubresourceRegion(
+                render_target,
+                0,
+                area[0],
+                area[1],
+                0,
+                &backdrop.filter_saved.texture,
+                0,
+                Some(&area_box(area)),
+            );
+        };
+        let plan = BackdropPlan::new(visible, filter.radius.0, width, height);
+        if plan.is_none() && filter.rotate_x == 0.0 {
+            restore_area();
+            return Ok(());
+        }
+        unsafe {
+            devices
+                .device_context
+                .CopyResource(&backdrop.frame_copy.texture, render_target)
+        };
+        let (source, target_rect, source_rect, clamp_rect) = match plan {
+            Some(plan) => {
+                self.backdrop_pass(
+                    backdrop.work[0].render_target_view.as_ref(),
+                    &backdrop.frame_copy.shader_resource_view,
+                    &pipeline.downsample_vertex,
+                    &pipeline.downsample_fragment,
+                    &pipeline.opaque_blend_state,
+                    &BackdropParams {
+                        target_rect: plan.small_rect,
+                        source_rect: plan.region_rect,
+                        clamp_rect: area_rect,
+                        source_size,
+                        block_size: plan.factor,
+                        ..BackdropParams::default()
+                    },
+                )?;
+                for (source, target, direction) in [(0, 1, [1.0, 0.0]), (1, 0, [0.0, 1.0])] {
+                    self.backdrop_pass(
+                        backdrop.work[target].render_target_view.as_ref(),
+                        &backdrop.work[source].shader_resource_view,
+                        &pipeline.blur_vertex,
+                        &pipeline.blur_fragment,
+                        &pipeline.opaque_blend_state,
+                        &BackdropParams {
+                            target_rect: plan.small_rect,
+                            source_rect: plan.small_rect,
+                            clamp_rect: plan.small_rect,
+                            source_size,
+                            direction,
+                            sigma: plan.small_sigma,
+                            ..BackdropParams::default()
+                        },
+                    )?;
+                }
+                (
+                    &backdrop.work[0].shader_resource_view,
+                    plan.visible_rect,
+                    plan.visible_in_small,
+                    plan.small_rect,
+                )
+            }
+            None => (
+                &backdrop.frame_copy.shader_resource_view,
+                area_rect,
+                area_rect,
+                area_rect,
+            ),
+        };
+        restore_area();
+        self.backdrop_pass(
+            None,
+            source,
+            &pipeline.filter_composite_vertex,
+            &pipeline.filter_composite_fragment,
+            &pipeline.composite_blend_state,
+            &BackdropParams {
+                target_rect,
+                source_rect,
+                clamp_rect,
+                content_mask: [
+                    filter.content_mask.bounds.origin.x.0,
+                    filter.content_mask.bounds.origin.y.0,
+                    filter.content_mask.bounds.size.width.0,
+                    filter.content_mask.bounds.size.height.0,
+                ],
+                source_size,
+                saturation: 1.0,
+                opacity: 1.0,
+                tilt: [
+                    filter.origin.x.0,
+                    filter.origin.y.0,
+                    filter.rotate_x,
+                    filter.perspective.0,
+                ],
+                ..BackdropParams::default()
+            },
+        )
     }
 
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
@@ -1360,6 +1568,8 @@ impl BackdropPipeline {
             blur_fragment: fragment(ShaderModule::BackdropBlur)?,
             composite_vertex: vertex(ShaderModule::BackdropComposite)?,
             composite_fragment: fragment(ShaderModule::BackdropComposite)?,
+            filter_composite_vertex: vertex(ShaderModule::FilterComposite)?,
+            filter_composite_fragment: fragment(ShaderModule::FilterComposite)?,
             opaque_blend_state: create_opaque_blend_state(device)?,
             composite_blend_state: create_blend_state(device)?,
             depth_stencil_state,
@@ -2138,6 +2348,7 @@ pub(crate) mod shader_resources {
         BackdropDownsample,
         BackdropBlur,
         BackdropComposite,
+        FilterComposite,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2223,6 +2434,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => BACKDROP_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => BACKDROP_COMPOSITE_FRAGMENT_BYTES,
                 },
+                ShaderModule::FilterComposite => match target {
+                    ShaderTarget::Vertex => FILTER_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => FILTER_COMPOSITE_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -2306,6 +2521,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::BackdropDownsample => "backdrop_downsample",
                 ShaderModule::BackdropBlur => "backdrop_blur",
                 ShaderModule::BackdropComposite => "backdrop_composite",
+                ShaderModule::FilterComposite => "filter_composite",
             }
         }
     }

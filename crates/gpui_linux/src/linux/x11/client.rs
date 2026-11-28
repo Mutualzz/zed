@@ -1135,6 +1135,7 @@ impl X11Client {
                             modifiers,
                             capslock,
                             code: None,
+                            key_pressed: None,
                         },
                     ));
                 }

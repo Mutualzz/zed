@@ -142,6 +142,7 @@ pub(crate) unsafe fn platform_input_from_native(
                             .contains(NSEventModifierFlags::CapsLock),
                     },
                     code: None,
+                    key_pressed: None,
                 }))
             }
             NSEventType::KeyDown => Some(PlatformInput::KeyDown(KeyDownEvent {

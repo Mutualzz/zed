@@ -74,6 +74,10 @@ pub struct ModifiersChangedEvent {
     /// The physical modifier key that changed, named like the DOM `KeyboardEvent.code`
     /// (`"ShiftLeft"`, `"ControlRight"`), when the platform reports it.
     pub code: Option<&'static str>,
+    /// Whether the physical key in `code` went down (`true`) or up (`false`), when the
+    /// platform reports it. Set even when the modifier state does not change, such as
+    /// releasing one Shift while the other is held or pressing and releasing CapsLock.
+    pub key_pressed: Option<bool>,
 }
 
 impl Sealed for ModifiersChangedEvent {}

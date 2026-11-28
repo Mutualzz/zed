@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Bounds, DevicePixels, GpuSpecs, PaintedPath, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
+    AtlasTextureId, Bounds, DevicePixels, ElementFilter, GpuSpecs, PaintedPath, PrimitiveBatch,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios, quad_depth, quad_depth_scale,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -128,6 +128,7 @@ struct BackdropParams {
     block_size: f32,
     premultiplied_alpha: u32,
     pad: u32,
+    tilt: [f32; 4],
 }
 
 struct BackdropPipelines {
@@ -135,6 +136,8 @@ struct BackdropPipelines {
     blur: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
+    filter_clear: wgpu::RenderPipeline,
+    filter_composite: wgpu::RenderPipeline,
 }
 
 /// The textures a frame with backdrop blurs renders through. The frame is
@@ -144,7 +147,9 @@ struct BackdropTargets {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
-    _textures: [wgpu::Texture; 3],
+    offscreen: wgpu::Texture,
+    work: [wgpu::Texture; 2],
+    filter_saved: wgpu::Texture,
     offscreen_view: wgpu::TextureView,
     offscreen_bind_group: wgpu::BindGroup,
     work_views: [wgpu::TextureView; 2],
@@ -162,7 +167,40 @@ struct BackdropParamsBuffer {
 /// `Scene::backdrop_blurs`, and one for the final copy.
 struct BackdropFramePlan {
     blurs: Vec<Option<[u32; 4]>>,
+    filters: Vec<Option<FilterPassPlan>>,
     blit_offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FilterPassPlan {
+    area: [u32; 4],
+    clear: u32,
+    blur: Option<[u32; 3]>,
+    composite: Option<u32>,
+}
+
+impl FilterPassPlan {
+    fn map_slots(self, offset: impl Fn(u32) -> u32) -> Self {
+        Self {
+            area: self.area,
+            clear: offset(self.clear),
+            blur: self.blur.map(|slots| slots.map(&offset)),
+            composite: self.composite.map(&offset),
+        }
+    }
+}
+
+fn filter_area(filter: &ElementFilter, width: u32, height: u32) -> Option<[u32; 4]> {
+    let visible = filter.bounds.intersect(&filter.content_mask.bounds);
+    let left = visible.origin.x.0.floor().clamp(0.0, width as f32) as u32;
+    let top = visible.origin.y.0.floor().clamp(0.0, height as f32) as u32;
+    let right = (visible.origin.x.0 + visible.size.width.0)
+        .ceil()
+        .clamp(0.0, width as f32) as u32;
+    let bottom = (visible.origin.y.0 + visible.size.height.0)
+        .ceil()
+        .clamp(0.0, height as f32) as u32;
+    (right > left && bottom > top).then_some([left, top, right, bottom])
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1063,35 +1101,39 @@ impl WgpuRendererCore {
                 bind_group_layouts: &[Some(&layouts.backdrop_params), Some(&layouts.texture)],
                 immediate_size: 0,
             });
+            let create_with_vertex =
+                |name: &str, vs_entry: &str, fs_entry: &str, blend: Option<wgpu::BlendState>| {
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some(name),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some(vs_entry),
+                            buffers: &[],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some(fs_entry),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: surface_format,
+                                blend,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleStrip,
+                            ..Default::default()
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+                };
             let create = |name: &str, fs_entry: &str, blend: Option<wgpu::BlendState>| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(name),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("vs_backdrop"),
-                        buffers: &[],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some(fs_entry),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: surface_format,
-                            blend,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
+                create_with_vertex(name, "vs_backdrop", fs_entry, blend)
             };
             BackdropPipelines {
                 downsample: create("backdrop_downsample", "fs_backdrop_downsample", None),
@@ -1102,6 +1144,13 @@ impl WgpuRendererCore {
                     Some(blend_mode),
                 ),
                 blit: create("backdrop_blit", "fs_backdrop_blit", None),
+                filter_clear: create("filter_clear", "fs_filter_clear", None),
+                filter_composite: create_with_vertex(
+                    "filter_composite",
+                    "vs_filter",
+                    "fs_filter_composite",
+                    Some(blend_mode),
+                ),
             }
         });
 
@@ -1513,8 +1562,8 @@ impl WgpuRendererCore {
                 )
             })?;
         let depth_scale = quad_depth_scale(scene.quads.len());
-        let backdrop_frame =
-            self.resources().pipelines.backdrop.is_some() && !scene.backdrop_blurs.is_empty();
+        let backdrop_frame = self.resources().pipelines.backdrop.is_some()
+            && (!scene.backdrop_blurs.is_empty() || !scene.filter_starts.is_empty());
         let globals = GlobalParams {
             viewport_size: [size.width.0 as f32, size.height.0 as f32],
             path_paint_base: instance_bindings.path_tiles.paint_base,
@@ -1623,6 +1672,22 @@ impl WgpuRendererCore {
                     }
                     continue;
                 }
+                if let PrimitiveBatch::FilterStart(index) | PrimitiveBatch::FilterEnd(index) =
+                    &batch
+                {
+                    if let (Some(targets), Some(plan)) = (backdrop_targets, backdrop_plan.as_ref())
+                        && let Some(filter) = plan.filters.get(*index).copied().flatten()
+                    {
+                        drop(pass);
+                        if matches!(batch, PrimitiveBatch::FilterStart(_)) {
+                            self.encode_filter_start(&mut encoder, targets, filter)?;
+                        } else {
+                            self.encode_filter_end(&mut encoder, targets, filter)?;
+                        }
+                        pass = begin_main_pass(&mut encoder, wgpu::LoadOp::Load);
+                    }
+                    continue;
+                }
                 // Quad shaders assign each quad its own depth.
                 // In every other batch type, the depth is fixed to the position of the quad cursor.
                 let (minimum_depth, maximum_depth) = if matches!(&batch, PrimitiveBatch::Quads(_)) {
@@ -1711,6 +1776,7 @@ impl WgpuRendererCore {
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                     PrimitiveBatch::BackdropBlurs(_blurs) => {}
+                    PrimitiveBatch::FilterStart(_) | PrimitiveBatch::FilterEnd(_) => {}
                 }
             }
         }
@@ -1769,7 +1835,9 @@ impl WgpuRendererCore {
                     dimension: wgpu::TextureDimension::D2,
                     format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1778,6 +1846,7 @@ impl WgpuRendererCore {
         let (offscreen, offscreen_view) = create("backdrop_offscreen");
         let (first_work, first_work_view) = create("backdrop_work_0");
         let (second_work, second_work_view) = create("backdrop_work_1");
+        let (filter_saved, _filter_saved_view) = create("filter_saved");
         let offscreen_bind_group =
             self.create_texture_bind_group("backdrop_offscreen_bind_group", &offscreen_view);
         let work_bind_groups = [
@@ -1788,7 +1857,9 @@ impl WgpuRendererCore {
             width,
             height,
             format,
-            _textures: [offscreen, first_work, second_work],
+            offscreen,
+            work: [first_work, second_work],
+            filter_saved,
             offscreen_view,
             offscreen_bind_group,
             work_views: [first_work_view, second_work_view],
@@ -1909,6 +1980,91 @@ impl WgpuRendererCore {
             });
             blurs.push(Some([first, first + 1, first + 2, first + 3]));
         }
+        let mut filters = Vec::with_capacity(scene.filter_starts.len());
+        for filter in &scene.filter_starts {
+            let Some(area) = filter_area(filter, size.width.0 as u32, size.height.0 as u32) else {
+                filters.push(None);
+                continue;
+            };
+            let area_rect = [
+                area[0] as f32,
+                area[1] as f32,
+                (area[2] - area[0]) as f32,
+                (area[3] - area[1]) as f32,
+            ];
+            let clear = params.len() as u32;
+            params.push(BackdropParams {
+                target_rect: area_rect,
+                source_rect: area_rect,
+                clamp_rect: area_rect,
+                ..base
+            });
+            let visible = Bounds {
+                origin: gpui::point(ScaledPixels(area_rect[0]), ScaledPixels(area_rect[1])),
+                size: gpui::size(ScaledPixels(area_rect[2]), ScaledPixels(area_rect[3])),
+            };
+            let plan = BackdropPlan::new(visible, filter.radius.0, width, height);
+            if plan.is_none() && filter.rotate_x == 0.0 {
+                filters.push(Some(FilterPassPlan {
+                    area,
+                    clear,
+                    blur: None,
+                    composite: None,
+                }));
+                continue;
+            }
+            let blur = plan.map(|plan| {
+                let first = params.len() as u32;
+                params.push(BackdropParams {
+                    target_rect: plan.small_rect,
+                    source_rect: plan.region_rect,
+                    clamp_rect: area_rect,
+                    block_size: plan.factor,
+                    ..base
+                });
+                for direction in [[1.0, 0.0], [0.0, 1.0]] {
+                    params.push(BackdropParams {
+                        target_rect: plan.small_rect,
+                        source_rect: plan.small_rect,
+                        clamp_rect: plan.small_rect,
+                        direction,
+                        sigma: plan.small_sigma,
+                        ..base
+                    });
+                }
+                [first, first + 1, first + 2]
+            });
+            let (target_rect, source_rect, clamp_rect) = plan
+                .map_or((area_rect, area_rect, area_rect), |plan| {
+                    (plan.visible_rect, plan.visible_in_small, plan.small_rect)
+                });
+            let composite = params.len() as u32;
+            params.push(BackdropParams {
+                target_rect,
+                source_rect,
+                clamp_rect,
+                content_mask: [
+                    filter.content_mask.bounds.origin.x.0,
+                    filter.content_mask.bounds.origin.y.0,
+                    filter.content_mask.bounds.size.width.0,
+                    filter.content_mask.bounds.size.height.0,
+                ],
+                opacity: 1.0,
+                tilt: [
+                    filter.origin.x.0,
+                    filter.origin.y.0,
+                    filter.rotate_x,
+                    filter.perspective.0,
+                ],
+                ..base
+            });
+            filters.push(Some(FilterPassPlan {
+                area,
+                clear,
+                blur,
+                composite: Some(composite),
+            }));
+        }
         let blit = params.len() as u32;
         params.push(BackdropParams {
             target_rect: full_rect,
@@ -1938,6 +2094,10 @@ impl WgpuRendererCore {
             blurs: blurs
                 .into_iter()
                 .map(|slots| slots.map(|slots| slots.map(offset)))
+                .collect(),
+            filters: filters
+                .into_iter()
+                .map(|filter| filter.map(|filter| filter.map_slots(offset)))
                 .collect(),
             blit_offset: offset(blit),
         })
@@ -2024,6 +2184,146 @@ impl WgpuRendererCore {
                 source,
                 target,
                 offset,
+                wgpu::LoadOp::Load,
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_area(
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::Texture,
+        target: &wgpu::Texture,
+        [left, top, right, bottom]: [u32; 4],
+    ) {
+        let origin = wgpu::Origin3d {
+            x: left,
+            y: top,
+            z: 0,
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: source,
+                mip_level: 0,
+                origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: target,
+                mip_level: 0,
+                origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: right - left,
+                height: bottom - top,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn encode_filter_start(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &BackdropTargets,
+        filter: FilterPassPlan,
+    ) -> Result<()> {
+        let pipelines = self
+            .resources()
+            .pipelines
+            .backdrop
+            .as_ref()
+            .context("backdrop pipelines missing")?;
+        let params = self
+            .backdrop_params
+            .as_ref()
+            .context("backdrop params missing")?;
+        Self::copy_area(
+            encoder,
+            &targets.offscreen,
+            &targets.filter_saved,
+            filter.area,
+        );
+        Self::encode_backdrop_pass(
+            encoder,
+            &pipelines.filter_clear,
+            &params.bind_group,
+            &targets.work_bind_groups[1],
+            &targets.offscreen_view,
+            filter.clear,
+            wgpu::LoadOp::Load,
+        );
+        Ok(())
+    }
+
+    fn encode_filter_end(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &BackdropTargets,
+        filter: FilterPassPlan,
+    ) -> Result<()> {
+        let pipelines = self
+            .resources()
+            .pipelines
+            .backdrop
+            .as_ref()
+            .context("backdrop pipelines missing")?;
+        let params = self
+            .backdrop_params
+            .as_ref()
+            .context("backdrop params missing")?;
+        if filter.composite.is_some() {
+            match filter.blur {
+                Some(offsets) => {
+                    let passes = [
+                        (
+                            &pipelines.downsample,
+                            &targets.offscreen_bind_group,
+                            &targets.work_views[0],
+                            offsets[0],
+                        ),
+                        (
+                            &pipelines.blur,
+                            &targets.work_bind_groups[0],
+                            &targets.work_views[1],
+                            offsets[1],
+                        ),
+                        (
+                            &pipelines.blur,
+                            &targets.work_bind_groups[1],
+                            &targets.work_views[0],
+                            offsets[2],
+                        ),
+                    ];
+                    for (pipeline, source, target, offset) in passes {
+                        Self::encode_backdrop_pass(
+                            encoder,
+                            pipeline,
+                            &params.bind_group,
+                            source,
+                            target,
+                            offset,
+                            wgpu::LoadOp::Load,
+                        );
+                    }
+                }
+                None => Self::copy_area(encoder, &targets.offscreen, &targets.work[0], filter.area),
+            }
+        }
+        Self::copy_area(
+            encoder,
+            &targets.filter_saved,
+            &targets.offscreen,
+            filter.area,
+        );
+        if let Some(composite) = filter.composite {
+            Self::encode_backdrop_pass(
+                encoder,
+                &pipelines.filter_composite,
+                &params.bind_group,
+                &targets.work_bind_groups[0],
+                &targets.offscreen_view,
+                composite,
                 wgpu::LoadOp::Load,
             );
         }
@@ -3463,8 +3763,9 @@ mod backdrop_tests {
 mod backdrop_render_tests {
     use super::WgpuHeadlessRenderer;
     use gpui::{
-        BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
-        PlatformHeadlessRenderer, Point, Quad, ScaledPixels, Scene, Size,
+        BackdropBlur, BorderStyle, Bounds, ContentMask, Corners, DevicePixels, Edges,
+        ElementFilter, Hsla, PlatformHeadlessRenderer, Point, Primitive, Quad, ScaledPixels, Scene,
+        Size,
     };
 
     fn device_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
@@ -3549,6 +3850,77 @@ mod backdrop_render_tests {
         assert_eq!(left_alpha, 255);
         assert_eq!(image.get_pixel(8, 16).0, [255, 0, 0, 255]);
         assert_eq!(image.get_pixel(56, 16).0, [0, 0, 255, 255]);
+        Ok(())
+    }
+
+    fn element_filter(bounds: Bounds<ScaledPixels>, radius: f32, degrees: f32) -> ElementFilter {
+        ElementFilter {
+            order: 0,
+            radius: ScaledPixels(radius),
+            rotate_x: degrees.to_radians(),
+            perspective: ScaledPixels(40.),
+            origin: Point {
+                x: bounds.origin.x + bounds.size.width / 2.,
+                y: bounds.origin.y + bounds.size.height / 2.,
+            },
+            bounds,
+            content_mask: ContentMask {
+                bounds: device_bounds(0., 0., 64., 32.),
+            },
+        }
+    }
+
+    fn filtered_green_scene(filter: ElementFilter) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(device_bounds(0., 0., 64., 32.), gpui::red()));
+        scene.insert_primitive(Primitive::FilterStart(filter));
+        scene.insert_primitive(solid_quad(device_bounds(16., 8., 32., 16.), gpui::green()));
+        scene.insert_primitive(Primitive::FilterEnd(filter));
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn element_filter_blurs_the_group_over_a_sharp_backdrop() -> anyhow::Result<()> {
+        let image = render(&filtered_green_scene(element_filter(
+            device_bounds(4., 0., 56., 32.),
+            3.0,
+            0.0,
+        )))?;
+        let [red, green, _, alpha] = image.get_pixel(16, 16).0;
+        assert!(
+            (40..=215).contains(&red) && (40..=215).contains(&green),
+            "the group's edge should be mixed with the backdrop, was {:?}",
+            image.get_pixel(16, 16).0
+        );
+        assert_eq!(alpha, 255);
+        let [middle_red, _, _, _] = image.get_pixel(32, 16).0;
+        assert!(middle_red <= 10, "the middle should stay green");
+        assert_eq!(image.get_pixel(1, 1).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(62, 30).0, [255, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn element_filter_tilts_the_top_edge_away() -> anyhow::Result<()> {
+        let image = render(&filtered_green_scene(element_filter(
+            device_bounds(16., 8., 32., 16.),
+            0.0,
+            60.0,
+        )))?;
+        let green_columns = |row: u32| {
+            (0..64)
+                .filter(|column| image.get_pixel(*column, row).0[0] < 128)
+                .count()
+        };
+        let top = green_columns(13);
+        let bottom = green_columns(18);
+        assert!(
+            top > 0 && top < bottom,
+            "the top row should be narrower than the bottom row, was {top} and {bottom}"
+        );
+        assert_eq!(image.get_pixel(32, 9).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(1, 1).0, [255, 0, 0, 255]);
         Ok(())
     }
 

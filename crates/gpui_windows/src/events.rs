@@ -828,6 +828,7 @@ impl WindowsWindowInner {
                     modifiers: current_modifiers(),
                     capslock: current_capslock(),
                     code: None,
+                    key_pressed: None,
                 });
                 func(input);
                 this.state.callbacks.input.set(Some(func));
@@ -1542,13 +1543,16 @@ where
     let modifiers = current_modifiers();
     let key_flags = lparam.hiword();
     let code = crate::keyboard::dom_code(key_flags & 0xFF, key_flags & KF_EXTENDED as u16 != 0);
+    let key_released = key_flags & KF_UP as u16 != 0;
+    let auto_repeat = !key_released && key_flags & KF_REPEAT as u16 != 0;
 
     match virtual_key {
         VK_SHIFT | VK_CONTROL | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN => {
-            if state
-                .last_reported_modifiers
-                .get()
-                .is_some_and(|prev_modifiers| prev_modifiers == modifiers)
+            if auto_repeat
+                && state
+                    .last_reported_modifiers
+                    .get()
+                    .is_some_and(|prev_modifiers| prev_modifiers == modifiers)
             {
                 return None;
             }
@@ -1557,15 +1561,17 @@ where
                 modifiers,
                 capslock: current_capslock(),
                 code,
+                key_pressed: Some(!key_released),
             }))
         }
         VK_PACKET => None,
         VK_CAPITAL => {
             let capslock = current_capslock();
-            if state
-                .last_reported_capslock
-                .get()
-                .is_some_and(|prev_capslock| prev_capslock == capslock)
+            if auto_repeat
+                && state
+                    .last_reported_capslock
+                    .get()
+                    .is_some_and(|prev_capslock| prev_capslock == capslock)
             {
                 return None;
             }
@@ -1574,6 +1580,7 @@ where
                 modifiers,
                 capslock,
                 code,
+                key_pressed: Some(!key_released),
             }))
         }
         vkey => {

@@ -1429,6 +1429,7 @@ cbuffer BackdropParams: register(b2) {
     float backdrop_saturation;
     float backdrop_opacity;
     float backdrop_block_size;
+    float4 backdrop_tilt;
 };
 
 struct BackdropFragmentInput {
@@ -1524,4 +1525,30 @@ float4 backdrop_composite_fragment(BackdropFragmentInput input): SV_Target {
     }
     float4 color = sample_backdrop(input.source_position);
     return float4(saturate_backdrop(color.rgb, backdrop_saturation), coverage * backdrop_opacity);
+}
+
+BackdropFragmentInput filter_composite_vertex(uint vertex_id: SV_VertexID) {
+    BackdropFragmentInput output = backdrop_quad(vertex_id);
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 target = backdrop_target_rect.xy + unit_vertex * backdrop_target_rect.zw;
+    float2 offset = target - backdrop_tilt.xy;
+    float depth = offset.y * sin(backdrop_tilt.z);
+    float clip_depth = backdrop_tilt.w > 0.0 ? max(1.0 - depth / backdrop_tilt.w, 0.05) : 1.0;
+    float2 projected = backdrop_tilt.xy + float2(offset.x, offset.y * cos(backdrop_tilt.z)) / clip_depth;
+    float2 device = projected / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    output.position = float4(device * clip_depth, 0.0, clip_depth);
+    return output;
+}
+
+float4 filter_composite_fragment(BackdropFragmentInput input): SV_Target {
+    float2 position = input.position.xy;
+    float2 mask_end = backdrop_content_mask.xy + backdrop_content_mask.zw;
+    if (any(position < backdrop_content_mask.xy) || any(position > mask_end)) {
+        discard;
+    }
+    float4 color = sample_backdrop(input.source_position);
+    if (color.a <= 0.0) {
+        discard;
+    }
+    return float4(saturate(color.rgb / color.a), color.a * backdrop_opacity);
 }

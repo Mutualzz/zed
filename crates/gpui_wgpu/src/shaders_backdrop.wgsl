@@ -19,6 +19,7 @@ struct BackdropParams {
     block_size: f32,
     premultiplied_alpha: u32,
     pad: u32,
+    tilt: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: BackdropParams;
@@ -32,6 +33,10 @@ struct BackdropVarying {
 
 @vertex
 fn vs_backdrop(@builtin(vertex_index) vertex_id: u32) -> BackdropVarying {
+    return backdrop_quad(vertex_id);
+}
+
+fn backdrop_quad(vertex_id: u32) -> BackdropVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let target_point = params.target_rect.xy + unit_vertex * params.target_rect.zw;
     var out: BackdropVarying;
@@ -130,6 +135,45 @@ fn fs_backdrop_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
     let alpha = coverage * params.opacity;
     let multiplier = select(1.0, alpha, params.premultiplied_alpha != 0u);
     return vec4<f32>(saturate_backdrop(color.rgb, params.saturation) * multiplier, alpha);
+}
+
+@vertex
+fn vs_filter(@builtin(vertex_index) vertex_id: u32) -> BackdropVarying {
+    var out = backdrop_quad(vertex_id);
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let target_point = params.target_rect.xy + unit_vertex * params.target_rect.zw;
+    let offset = target_point - params.tilt.xy;
+    let depth = offset.y * sin(params.tilt.z);
+    var clip_depth = 1.0;
+    if (params.tilt.w > 0.0) {
+        clip_depth = max(1.0 - depth / params.tilt.w, 0.05);
+    }
+    let projected = params.tilt.xy + vec2<f32>(offset.x, offset.y * cos(params.tilt.z)) / clip_depth;
+    let device = projected / params.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    out.position = vec4<f32>(device * clip_depth, 0.0, clip_depth);
+    return out;
+}
+
+@fragment
+fn fs_filter_clear(input: BackdropVarying) -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+
+@fragment
+fn fs_filter_composite(input: BackdropVarying) -> @location(0) vec4<f32> {
+    let position = input.position.xy;
+    let mask_end = params.content_mask.xy + params.content_mask.zw;
+    if (any(position < params.content_mask.xy) || any(position > mask_end)) {
+        discard;
+    }
+    let color = sample_backdrop(input.source_position);
+    if (color.a <= 0.0) {
+        discard;
+    }
+    let alpha = color.a * params.opacity;
+    let straight = clamp(color.rgb / color.a, vec3<f32>(0.0), vec3<f32>(1.0));
+    let multiplier = select(1.0, alpha, params.premultiplied_alpha != 0u);
+    return vec4<f32>(straight * multiplier, alpha);
 }
 
 // Copies the offscreen frame to the window surface unchanged.

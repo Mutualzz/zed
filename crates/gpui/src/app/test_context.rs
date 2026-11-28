@@ -1010,6 +1010,7 @@ impl VisualTestContext {
             modifiers,
             capslock: Capslock { on: false },
             code: None,
+            key_pressed: None,
         })
     }
 
@@ -1019,6 +1020,7 @@ impl VisualTestContext {
             modifiers: Modifiers::none(),
             capslock: Capslock { on },
             code: None,
+            key_pressed: None,
         })
     }
 
